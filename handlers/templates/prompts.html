@@ -1,0 +1,54 @@
+{{define "content"}}
+<h1 class="page-title">Prompt History</h1>
+
+<div class="card">
+  <div class="card-title">Requests ({{.Total}} total)</div>
+  {{if .Requests}}
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Classification</th>
+        <th>Model</th>
+        <th>Prompt</th>
+        <th>Latency</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Requests}}
+      <tr>
+        <td style="font-size:12px;color:#64748b;white-space:nowrap">{{.Timestamp.Format "Jan 2 15:04:05"}}</td>
+        <td>
+          {{if eq .Classification "thinking"}}<span class="badge badge-thinking">thinking</span>
+          {{else if eq .Classification "coding"}}<span class="badge badge-coding">coding</span>
+          {{else if eq .Classification "simple"}}<span class="badge badge-simple">simple</span>
+          {{else}}<span class="badge badge-general">{{.Classification}}</span>{{end}}
+        </td>
+        <td class="mono" style="font-size:12px;white-space:nowrap">{{.Model}}</td>
+        <td class="prompt-cell">{{.Prompt}}</td>
+        <td style="white-space:nowrap;font-size:13px">{{.LatencyMS}}ms</td>
+        <td style="font-size:13px">
+          {{if eq .StatusCode 200}}<span style="color:#166534">{{.StatusCode}}</span>
+          {{else}}<span style="color:#991b1b">{{.StatusCode}}</span>{{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+
+  {{if gt .Pages 1}}
+  <div class="pagination">
+    {{if gt .PageNum 1}}<a href="/admin/prompts?page={{sub .PageNum 1}}" class="page-btn">← Prev</a>{{end}}
+    {{range $i := pages .Pages}}
+    <a href="/admin/prompts?page={{add $i 1}}" class="page-btn {{if eq (add $i 1) $.PageNum}}active{{end}}">{{add $i 1}}</a>
+    {{end}}
+    {{if lt .PageNum .Pages}}<a href="/admin/prompts?page={{add .PageNum 1}}" class="page-btn">Next →</a>{{end}}
+  </div>
+  {{end}}
+
+  {{else}}
+  <p style="color:#94a3b8;font-size:14px">No requests recorded yet.</p>
+  {{end}}
+</div>
+{{end}}

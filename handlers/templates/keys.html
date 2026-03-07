@@ -1,0 +1,66 @@
+{{define "content"}}
+<h1 class="page-title">API Keys</h1>
+
+{{if .NewKey}}
+<div class="flash flash-key">
+  <strong>New key created — copy it now, it won't be shown again:</strong><br><br>
+  {{.NewKey}}
+</div>
+{{end}}
+{{if .Error}}<div class="flash flash-error">{{.Error}}</div>{{end}}
+
+<div class="card" style="margin-bottom:20px">
+  <div class="card-title">Create New Key</div>
+  <form method="POST" action="/admin/keys" style="display:flex;gap:12px;align-items:flex-end">
+    <div class="form-group" style="flex:1;margin-bottom:0">
+      <label for="name">Key Name</label>
+      <input type="text" id="name" name="name" placeholder="e.g. production-app" required style="margin-bottom:0">
+    </div>
+    <button type="submit" class="btn btn-primary">Create Key</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">Existing Keys</div>
+  {{if .Keys}}
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Preview</th>
+        <th>Status</th>
+        <th>Created</th>
+        <th>Last Used</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Keys}}
+      <tr>
+        <td style="font-weight:500">{{.Name}}</td>
+        <td class="mono" style="color:#64748b;font-size:13px">{{.KeyPreview}}…</td>
+        <td>
+          {{if .Active}}<span class="badge badge-active">active</span>
+          {{else}}<span class="badge badge-revoked">revoked</span>{{end}}
+        </td>
+        <td style="font-size:13px;color:#64748b">{{.CreatedAt.Format "Jan 2, 2006"}}</td>
+        <td style="font-size:13px;color:#64748b">
+          {{if .LastUsedAt}}{{.LastUsedAt.Format "Jan 2 15:04"}}{{else}}—{{end}}
+        </td>
+        <td>
+          {{if .Active}}
+          <form method="POST" action="/admin/keys/{{.ID}}/revoke" style="display:inline" onsubmit="return confirm('Revoke this key?')">
+            <button type="submit" class="btn btn-danger btn-sm">Revoke</button>
+          </form>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p style="color:#94a3b8;font-size:14px">No API keys yet. Create one above.</p>
+  <p style="color:#94a3b8;font-size:13px;margin-top:6px">Until at least one active key exists, the <code>/v1/chat/completions</code> endpoint is open.</p>
+  {{end}}
+</div>
+{{end}}

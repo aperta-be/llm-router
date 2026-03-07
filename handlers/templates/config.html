@@ -1,0 +1,72 @@
+{{define "content"}}
+<h1 class="page-title">Configuration</h1>
+
+{{if .Saved}}<div class="flash flash-success">✓ Configuration saved successfully.</div>{{end}}
+
+<div class="card">
+  <div class="card-title">Ollama Connection</div>
+  <form method="POST" action="/admin/config">
+    <div class="form-group">
+      <label for="ollama_base_url">Ollama Base URL</label>
+      <input type="url" id="ollama_base_url" name="ollama_base_url" value="{{.Cfg.OllamaBaseURL}}" placeholder="http://0.0.0.0:11434" required>
+    </div>
+
+    <div class="card-title" style="margin-top:24px">Model Assignments</div>
+    <div class="two-col">
+      <div class="form-group">
+        <label for="classifier_model">Classifier Model</label>
+        <input type="text" id="classifier_model" name="classifier_model" value="{{.Cfg.ClassifierModel}}" required>
+        <span style="font-size:12px;color:#94a3b8">Classifies every request — must be fast</span>
+      </div>
+      <div class="form-group">
+        <label for="simple_model">Simple Model</label>
+        <input type="text" id="simple_model" name="simple_model" value="{{.Cfg.SimpleModel}}" required>
+        <span style="font-size:12px;color:#94a3b8">Short factual questions, greetings — can differ from classifier</span>
+      </div>
+      <div class="form-group">
+        <label for="thinking_model">Thinking Model</label>
+        <input type="text" id="thinking_model" name="thinking_model" value="{{.Cfg.ThinkingModel}}" required>
+        <span style="font-size:12px;color:#94a3b8">Reasoning, planning, analysis, math</span>
+      </div>
+      <div class="form-group">
+        <label for="coding_model">Coding Model</label>
+        <input type="text" id="coding_model" name="coding_model" value="{{.Cfg.CodingModel}}" required>
+        <span style="font-size:12px;color:#94a3b8">Writing, debugging, reviewing code</span>
+      </div>
+      <div class="form-group">
+        <label for="default_model">Default Model</label>
+        <input type="text" id="default_model" name="default_model" value="{{.Cfg.DefaultModel}}" required>
+        <span style="font-size:12px;color:#94a3b8">General tasks / fallback</span>
+      </div>
+    </div>
+
+    <div class="card-title" style="margin-top:24px">Performance</div>
+    <div class="two-col">
+      <div class="form-group">
+        <label for="classifier_timeout_s">Classifier Timeout (seconds)</label>
+        <input type="text" id="classifier_timeout_s" name="classifier_timeout_s" value="{{.Cfg.ClassifierTimeoutS}}">
+        <span style="font-size:12px;color:#94a3b8">Falls back to default model on timeout</span>
+      </div>
+      <div class="form-group">
+        <label for="cache_ttl_s">Cache TTL (seconds)</label>
+        <input type="text" id="cache_ttl_s" name="cache_ttl_s" value="{{.Cfg.CacheTTLS}}">
+        <span style="font-size:12px;color:#94a3b8">How long to cache classification results</span>
+      </div>
+      <div class="form-group">
+        <label for="cache_max_size">Cache Max Size</label>
+        <input type="text" id="cache_max_size" name="cache_max_size" value="{{.Cfg.CacheMaxSize}}">
+        <span style="font-size:12px;color:#94a3b8">Max number of cached prompt classifications</span>
+      </div>
+    </div>
+
+    <div class="card-title" style="margin-top:24px">Classification Prompt</div>
+    <div class="form-group">
+      <label for="classification_prompt">System prompt sent to the classifier model</label>
+      <textarea id="classification_prompt" name="classification_prompt" rows="18"
+        style="width:100%;padding:9px 12px;border:1px solid #e2e8f0;border-radius:7px;font-size:13px;font-family:monospace;resize:vertical;background:#f8fafc;color:#0f172a">{{.Cfg.ClassificationPrompt}}</textarea>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Save Changes</button>
+  </form>
+</div>
+{{end}}
