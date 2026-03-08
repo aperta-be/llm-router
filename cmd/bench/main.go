@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"text/tabwriter"
 	"time"
 )
@@ -175,6 +176,7 @@ func printSummary(label string, results []result) {
 	var correct int
 	var totalMS, minMS, maxMS int64
 	minMS = 1<<62 - 1
+	latencies := make([]int64, 0, len(results))
 	for _, r := range results {
 		if r.correct {
 			correct++
@@ -186,10 +188,25 @@ func printSummary(label string, results []result) {
 		if r.latencyMS > maxMS {
 			maxMS = r.latencyMS
 		}
+		latencies = append(latencies, r.latencyMS)
 	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	n := int64(len(results))
-	fmt.Printf("%s  accuracy=%d/%d (%.0f%%)  avg=%dms  min=%dms  max=%dms\n",
-		label, correct, n, float64(correct)/float64(n)*100, totalMS/n, minMS, maxMS)
+	fmt.Printf("%s  accuracy=%d/%d (%.0f%%)  avg=%dms  p50=%dms  p95=%dms  p99=%dms  min=%dms  max=%dms\n",
+		label, correct, n, float64(correct)/float64(n)*100,
+		totalMS/n, percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99),
+		minMS, maxMS)
+}
+
+func percentile(sorted []int64, p int) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(float64(p)/100.0*float64(len(sorted)-1) + 0.5)
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
 }
 
 func printAccuracyByCategory(results []result) {

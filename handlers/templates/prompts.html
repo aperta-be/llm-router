@@ -2,7 +2,36 @@
 <h1 class="page-title">Prompt History</h1>
 
 <div class="card">
-  <div class="card-title">Requests ({{.Total}} total)</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+    <div class="card-title" style="margin-bottom:0">Requests ({{.Total}} total)</div>
+    <div style="display:flex;gap:8px">
+      <a href="/admin/prompts/export?format=csv&search={{.Search}}&classification={{.Classification}}&model={{.Model}}"
+         class="btn" style="font-size:13px;padding:6px 12px;text-decoration:none">↓ CSV</a>
+      <a href="/admin/prompts/export?format=json&search={{.Search}}&classification={{.Classification}}&model={{.Model}}"
+         class="btn" style="font-size:13px;padding:6px 12px;text-decoration:none">↓ JSON</a>
+    </div>
+  </div>
+
+  <form method="GET" action="/admin/prompts" style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+    <input type="text" name="search" value="{{.Search}}" placeholder="Search prompts…"
+           style="flex:1;min-width:180px;padding:7px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px">
+    <select name="classification" style="padding:7px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px">
+      <option value="">All classifications</option>
+      <option value="thinking" {{if eq .Classification "thinking"}}selected{{end}}>thinking</option>
+      <option value="coding" {{if eq .Classification "coding"}}selected{{end}}>coding</option>
+      <option value="simple" {{if eq .Classification "simple"}}selected{{end}}>simple</option>
+      <option value="general" {{if eq .Classification "general"}}selected{{end}}>general</option>
+    </select>
+    <select name="model" style="padding:7px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px">
+      <option value="">All models</option>
+      {{range .Models}}<option value="{{.}}" {{if eq . $.Model}}selected{{end}}>{{.}}</option>{{end}}
+    </select>
+    <button type="submit" class="btn btn-primary" style="font-size:13px;padding:7px 14px">Filter</button>
+    {{if or .Search .Classification .Model}}
+    <a href="/admin/prompts" class="btn" style="font-size:13px;padding:7px 14px;text-decoration:none">Clear</a>
+    {{end}}
+  </form>
+
   {{if .Requests}}
   <table>
     <thead>
@@ -39,16 +68,16 @@
 
   {{if gt .Pages 1}}
   <div class="pagination">
-    {{if gt .PageNum 1}}<a href="/admin/prompts?page={{sub .PageNum 1}}" class="page-btn">← Prev</a>{{end}}
+    {{if gt .PageNum 1}}<a href="/admin/prompts?page={{sub .PageNum 1}}&search={{.Search}}&classification={{.Classification}}&model={{.Model}}" class="page-btn">← Prev</a>{{end}}
     {{range $i := pages .Pages}}
-    <a href="/admin/prompts?page={{add $i 1}}" class="page-btn {{if eq (add $i 1) $.PageNum}}active{{end}}">{{add $i 1}}</a>
+    <a href="/admin/prompts?page={{add $i 1}}&search=$.Search&classification=$.Classification&model=$.Model" class="page-btn {{if eq (add $i 1) $.PageNum}}active{{end}}">{{add $i 1}}</a>
     {{end}}
-    {{if lt .PageNum .Pages}}<a href="/admin/prompts?page={{add .PageNum 1}}" class="page-btn">Next →</a>{{end}}
+    {{if lt .PageNum .Pages}}<a href="/admin/prompts?page={{add .PageNum 1}}&search={{.Search}}&classification={{.Classification}}&model={{.Model}}" class="page-btn">Next →</a>{{end}}
   </div>
   {{end}}
 
   {{else}}
-  <p style="color:#94a3b8;font-size:14px">No requests recorded yet.</p>
+  <p style="color:#94a3b8;font-size:14px">No requests found.</p>
   {{end}}
 </div>
 {{end}}

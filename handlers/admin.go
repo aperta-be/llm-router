@@ -2,10 +2,14 @@ package handlers
 
 import (
 	"embed"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"html/template"
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -66,15 +70,40 @@ func (h *AdminHandler) LoginPage(c *gin.Context) {
 func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 	username := c.PostForm("username")
 	password := c.PostForm("password")
+	ip := c.ClientIP()
+	lockKey := "user:" + username
+
+	// Check lockout by username
+	if locked, _ := h.store.IsLoginLocked(lockKey); locked {
+		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.Status(http.StatusTooManyRequests)
+		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes."})
+		return
+	}
+	// Also check by IP
+	ipKey := "ip:" + ip
+	if locked, _ := h.store.IsLoginLocked(ipKey); locked {
+		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.Status(http.StatusTooManyRequests)
+		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes."})
+		return
+	}
 
 	ok, err := h.store.AuthenticateUser(username, password)
 	if err != nil || !ok {
+		h.store.RecordLoginFailure(lockKey)
+		h.store.RecordLoginFailure(ipKey)
 		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Status(http.StatusUnauthorized)
 		tmpl.Execute(c.Writer, gin.H{"Error": "Invalid username or password."})
 		return
 	}
+
+	h.store.ClearLoginFailures(lockKey)
+	h.store.ClearLoginFailures(ipKey)
 
 	token, err := h.store.CreateSession()
 	if err != nil {
@@ -95,14 +124,32 @@ func (h *AdminHandler) Logout(c *gin.Context) {
 
 // --- Dashboard ---
 
+type periodOption struct {
+	Value string
+	Label string
+}
+
 type dashboardData struct {
-	Page   string
-	Stats  store.Stats
-	Recent []store.RequestRecord
+	Page    string
+	Stats   store.Stats
+	Recent  []store.RequestRecord
+	Period  string
+	Periods []periodOption
+}
+
+var periodOptions = []periodOption{
+	{"1h", "1h"},
+	{"24h", "24h"},
+	{"7d", "7d"},
+	{"30d", "30d"},
+	{"all", "All time"},
 }
 
 func (h *AdminHandler) Dashboard(c *gin.Context) {
-	stats, err := h.store.GetStats()
+	period := c.DefaultQuery("period", "all")
+	since := periodToTime(period)
+
+	stats, err := h.store.GetStats(since)
 	if err != nil {
 		log.Printf("get stats: %v", err)
 	}
@@ -110,7 +157,29 @@ func (h *AdminHandler) Dashboard(c *gin.Context) {
 	if err != nil {
 		log.Printf("list recent: %v", err)
 	}
-	h.render(c, "dashboard.html", dashboardData{Page: "dashboard", Stats: stats, Recent: recent})
+	h.render(c, "dashboard.html", dashboardData{
+		Page:    "dashboard",
+		Stats:   stats,
+		Recent:  recent,
+		Period:  period,
+		Periods: periodOptions,
+	})
+}
+
+func periodToTime(period string) time.Time {
+	now := time.Now()
+	switch period {
+	case "1h":
+		return now.Add(-time.Hour)
+	case "24h":
+		return now.Add(-24 * time.Hour)
+	case "7d":
+		return now.Add(-7 * 24 * time.Hour)
+	case "30d":
+		return now.Add(-30 * 24 * time.Hour)
+	default:
+		return time.Time{} // zero time = no filter
+	}
 }
 
 // --- Config ---
@@ -185,7 +254,9 @@ func (h *AdminHandler) KeyCreate(c *gin.Context) {
 		return
 	}
 
-	rawKey, err := h.store.CreateAPIKey(name)
+	expiryDays, _ := strconv.Atoi(c.PostForm("expiry_days"))
+
+	rawKey, err := h.store.CreateAPIKey(name, expiryDays)
 	if err != nil {
 		log.Printf("create key: %v", err)
 		keys, _ := h.store.ListAPIKeys()
@@ -211,11 +282,15 @@ func (h *AdminHandler) KeyRevoke(c *gin.Context) {
 // --- Prompts ---
 
 type promptsData struct {
-	Page     string
-	Requests []store.RequestRecord
-	Total    int64
-	Pages    int
-	PageNum  int
+	Page           string
+	Requests       []store.RequestRecord
+	Total          int64
+	Pages          int
+	PageNum        int
+	Search         string
+	Classification string
+	Model          string
+	Models         []string
 }
 
 func (h *AdminHandler) PromptsPage(c *gin.Context) {
@@ -225,21 +300,144 @@ func (h *AdminHandler) PromptsPage(c *gin.Context) {
 	}
 	offset := (page - 1) * perPage
 
-	requests, err := h.store.ListRequests(perPage, offset)
+	f := store.RequestFilter{
+		Search:         c.Query("search"),
+		Classification: c.Query("classification"),
+		Model:          c.Query("model"),
+	}
+
+	requests, err := h.store.ListRequestsFiltered(perPage, offset, f)
 	if err != nil {
 		log.Printf("list requests: %v", err)
 	}
-	total, _ := h.store.CountRequests()
+	total, _ := h.store.CountRequestsFiltered(f)
 	pages := int(total) / perPage
 	if int(total)%perPage > 0 {
 		pages++
 	}
+	models, _ := h.store.DistinctModels()
 
 	h.render(c, "prompts.html", promptsData{
-		Page:     "prompts",
-		Requests: requests,
-		Total:    total,
-		Pages:    pages,
-		PageNum:  page,
+		Page:           "prompts",
+		Requests:       requests,
+		Total:          total,
+		Pages:          pages,
+		PageNum:        page,
+		Search:         f.Search,
+		Classification: f.Classification,
+		Model:          f.Model,
+		Models:         models,
 	})
+}
+
+// --- Export ---
+
+func (h *AdminHandler) PromptsExport(c *gin.Context) {
+	format := c.DefaultQuery("format", "json")
+	f := store.RequestFilter{
+		Search:         c.Query("search"),
+		Classification: c.Query("classification"),
+		Model:          c.Query("model"),
+	}
+
+	records, err := h.store.AllRequests(f)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	switch format {
+	case "csv":
+		c.Header("Content-Disposition", `attachment; filename="requests.csv"`)
+		c.Header("Content-Type", "text/csv")
+		w := c.Writer
+		w.WriteString("id,timestamp,classification,model,prompt,latency_ms,status_code,cache_hit\n")
+		for _, r := range records {
+			cacheHit := "0"
+			if r.CacheHit {
+				cacheHit = "1"
+			}
+			// Escape prompt for CSV (replace " with "")
+			prompt := "\"" + strings.ReplaceAll(r.Prompt, "\"", "\"\"") + "\""
+			w.WriteString(fmt.Sprintf("%d,%s,%s,%s,%s,%d,%d,%s\n",
+				r.ID,
+				r.Timestamp.Format("2006-01-02T15:04:05Z"),
+				r.Classification,
+				r.Model,
+				prompt,
+				r.LatencyMS,
+				r.StatusCode,
+				cacheHit,
+			))
+		}
+	default: // json
+		c.Header("Content-Disposition", `attachment; filename="requests.json"`)
+		c.JSON(http.StatusOK, records)
+	}
+}
+
+// --- Test Connection ---
+
+type connectionResult struct {
+	Reachable      bool     `json:"reachable"`
+	AvailableModels []string `json:"available_models"`
+	ConfiguredModels []configuredModel `json:"configured_models"`
+}
+
+type configuredModel struct {
+	Role      string `json:"role"`
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+}
+
+func (h *AdminHandler) TestConnection(c *gin.Context) {
+	cfg, err := h.store.GetConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	type tagsResponse struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(cfg.OllamaBaseURL + "/api/tags")
+	result := connectionResult{}
+	if err != nil || resp.StatusCode != http.StatusOK {
+		c.JSON(http.StatusOK, result)
+		return
+	}
+	defer resp.Body.Close()
+
+	var tags tagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
+	result.Reachable = true
+	for _, m := range tags.Models {
+		result.AvailableModels = append(result.AvailableModels, m.Name)
+	}
+
+	availSet := make(map[string]bool)
+	for _, m := range result.AvailableModels {
+		availSet[m] = true
+	}
+
+	for _, cm := range []configuredModel{
+		{Role: "Classifier", Name: cfg.ClassifierModel},
+		{Role: "Thinking", Name: cfg.ThinkingModel},
+		{Role: "Coding", Name: cfg.CodingModel},
+		{Role: "Simple", Name: cfg.SimpleModel},
+		{Role: "Default", Name: cfg.DefaultModel},
+	} {
+		cm.Available = availSet[cm.Name]
+		result.ConfiguredModels = append(result.ConfiguredModels, cm)
+	}
+
+	c.JSON(http.StatusOK, result)
 }

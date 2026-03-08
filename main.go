@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -58,15 +64,36 @@ func main() {
 		authed.GET("/dashboard", admin.Dashboard)
 		authed.GET("/config", admin.ConfigPage)
 		authed.POST("/config", admin.ConfigSave)
+		authed.GET("/test-connection", admin.TestConnection)
 		authed.GET("/keys", admin.KeysPage)
 		authed.POST("/keys", admin.KeyCreate)
 		authed.POST("/keys/:id/revoke", admin.KeyRevoke)
 		authed.GET("/prompts", admin.PromptsPage)
+		authed.GET("/prompts/export", admin.PromptsExport)
 	}
 
-	log.Printf("llm-router starting on :%s (ollama: %s, db: %s)", cfg.Port, cfg.OllamaBaseURL, cfg.DBPath)
-	log.Printf("admin panel: http://localhost:%s/admin", cfg.Port)
-	if err := r.Run(":" + cfg.Port); err != nil {
-		log.Fatalf("server error: %v", err)
+	srv := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: r,
 	}
+
+	go func() {
+		log.Printf("llm-router starting on :%s (ollama: %s, db: %s)", cfg.Port, cfg.OllamaBaseURL, cfg.DBPath)
+		log.Printf("admin panel: http://localhost:%s/admin", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("forced shutdown: %v", err)
+	}
+	log.Println("server stopped")
 }
