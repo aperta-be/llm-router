@@ -1,0 +1,24 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+  llm-router:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin       # CHANGE THIS
+    volumes:
+      - router_data:/data
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_data:
+  router_data:

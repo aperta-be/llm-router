@@ -4,3 +4,4 @@
 bench
 llm-router
 .worktrees/
+.env

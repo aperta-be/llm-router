@@ -13,7 +13,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 
-	"llm-router/config"
+	"github.com/aperta-be/llm-router/config"
 )
 
 const sessionTTL = 24 * time.Hour
@@ -35,6 +35,14 @@ type AppConfig struct {
 	CacheMaxSize         int
 }
 
+type User struct {
+	ID        int64
+	Username  string
+	Role      string
+	Active    bool
+	CreatedAt time.Time
+}
+
 type APIKey struct {
 	ID         int64
 	Name       string
@@ -43,6 +51,7 @@ type APIKey struct {
 	CreatedAt  time.Time
 	LastUsedAt *time.Time
 	ExpiresAt  *time.Time
+	OwnerName  string // populated by ListAPIKeys (admin view)
 }
 
 type RequestRecord struct {
@@ -113,11 +122,15 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS users (
 			id            INTEGER PRIMARY KEY AUTOINCREMENT,
 			username      TEXT NOT NULL UNIQUE,
-			password_hash TEXT NOT NULL
+			password_hash TEXT NOT NULL,
+			role          TEXT NOT NULL DEFAULT 'admin',
+			active        INTEGER NOT NULL DEFAULT 1,
+			created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			token      TEXT PRIMARY KEY,
-			expires_at DATETIME NOT NULL
+			expires_at DATETIME NOT NULL,
+			user_id    INTEGER
 		)`,
 		`CREATE TABLE IF NOT EXISTS login_attempts (
 			key        TEXT NOT NULL,
@@ -136,6 +149,12 @@ func (s *Store) migrate() error {
 	s.db.Exec(`ALTER TABLE requests ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0`)
 	// Add expires_at column for existing databases (ignore error if already exists)
 	s.db.Exec(`ALTER TABLE api_keys ADD COLUMN expires_at DATETIME`)
+	// Add user management columns (ignore error if already exists)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'`)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1`)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP`)
+	s.db.Exec(`ALTER TABLE api_keys ADD COLUMN user_id INTEGER REFERENCES users(id)`)
+	s.db.Exec(`ALTER TABLE sessions ADD COLUMN user_id INTEGER`)
 	// Add indices for commonly queried columns (idempotent)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp)`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model)`)
@@ -175,16 +194,23 @@ func (s *Store) SeedUser(username, password string) error {
 	return err
 }
 
-func (s *Store) AuthenticateUser(username, password string) (bool, error) {
+func (s *Store) AuthenticateUser(username, password string) (userID int64, role string, ok bool, err error) {
 	var hash string
-	err := s.db.QueryRow(`SELECT password_hash FROM users WHERE username = ?`, username).Scan(&hash)
+	var active int64
+	err = s.db.QueryRow(`SELECT id, password_hash, role, active FROM users WHERE username = ?`, username).Scan(&userID, &hash, &role, &active)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return 0, "", false, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, "", false, err
 	}
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil, nil
+	if active != 1 {
+		return 0, "", false, nil
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		return 0, "", false, nil
+	}
+	return userID, role, true, nil
 }
 
 // GetConfig reads all config values from the DB.
@@ -292,7 +318,69 @@ func (s *Store) ValidateAPIKey(rawKey string) (bool, error) {
 
 func (s *Store) ListAPIKeys() ([]APIKey, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, key_preview, active, created_at, last_used_at, expires_at FROM api_keys ORDER BY created_at DESC`,
+		`SELECT k.id, k.name, k.key_preview, k.active, k.created_at, k.last_used_at, k.expires_at, COALESCE(u.username, '')
+		 FROM api_keys k
+		 LEFT JOIN users u ON u.id = k.user_id
+		 ORDER BY k.created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []APIKey
+	for rows.Next() {
+		var k APIKey
+		var active int64
+		var lastUsed sql.NullTime
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&k.ID, &k.Name, &k.KeyPreview, &active, &k.CreatedAt, &lastUsed, &expiresAt, &k.OwnerName); err != nil {
+			return nil, err
+		}
+		k.Active = active == 1
+		if lastUsed.Valid {
+			k.LastUsedAt = &lastUsed.Time
+		}
+		if expiresAt.Valid {
+			k.ExpiresAt = &expiresAt.Time
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+func (s *Store) RevokeAPIKey(id int64) error {
+	_, err := s.db.Exec(`UPDATE api_keys SET active = 0 WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) CreateAPIKeyForUser(name string, expiryDays int, userID int64) (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	rawKey := "llmr_" + hex.EncodeToString(b)
+	hash := sha256.Sum256([]byte(rawKey))
+	keyHash := hex.EncodeToString(hash[:])
+	preview := rawKey[:13]
+
+	var expiresAt any
+	if expiryDays > 0 {
+		t := time.Now().Add(time.Duration(expiryDays) * 24 * time.Hour)
+		expiresAt = t
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO api_keys (name, key_hash, key_preview, active, created_at, expires_at, user_id) VALUES (?, ?, ?, 1, ?, ?, ?)`,
+		name, keyHash, preview, time.Now(), expiresAt, userID,
+	)
+	return rawKey, err
+}
+
+func (s *Store) ListAPIKeysByUser(userID int64) ([]APIKey, error) {
+	rows, err := s.db.Query(
+		`SELECT id, name, key_preview, active, created_at, last_used_at, expires_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC`,
+		userID,
 	)
 	if err != nil {
 		return nil, err
@@ -320,9 +408,68 @@ func (s *Store) ListAPIKeys() ([]APIKey, error) {
 	return keys, nil
 }
 
-func (s *Store) RevokeAPIKey(id int64) error {
-	_, err := s.db.Exec(`UPDATE api_keys SET active = 0 WHERE id = ?`, id)
+func (s *Store) RevokeAPIKeyForUser(id, userID int64) error {
+	if userID == 0 {
+		// Admin bypass: revoke regardless of owner
+		return s.RevokeAPIKey(id)
+	}
+	_, err := s.db.Exec(`UPDATE api_keys SET active = 0 WHERE id = ? AND user_id = ?`, id, userID)
 	return err
+}
+
+// User management
+
+func (s *Store) CreateUser(username, password, role string) error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT OR IGNORE INTO users (username, password_hash, role, active, created_at) VALUES (?, ?, ?, 1, ?)`,
+		username, string(hash), role, time.Now(),
+	)
+	return err
+}
+
+func (s *Store) ListUsers() ([]User, error) {
+	rows, err := s.db.Query(`SELECT id, username, role, active, created_at FROM users ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var u User
+		var active int64
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &active, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		u.Active = active == 1
+		users = append(users, u)
+	}
+	return users, nil
+}
+
+func (s *Store) SetUserActive(id int64, active bool) error {
+	v := 0
+	if active {
+		v = 1
+	}
+	_, err := s.db.Exec(`UPDATE users SET active = ? WHERE id = ?`, v, id)
+	return err
+}
+
+func (s *Store) GetUserByID(id int64) (User, error) {
+	var u User
+	var active int64
+	err := s.db.QueryRow(`SELECT id, username, role, active, created_at FROM users WHERE id = ?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &active, &u.CreatedAt)
+	if err != nil {
+		return User{}, err
+	}
+	u.Active = active == 1
+	return u, nil
 }
 
 // Request tracking
@@ -430,14 +577,34 @@ func (s *Store) GetStats(since time.Time) (Stats, error) {
 
 // Session management (persisted to SQLite)
 
-func (s *Store) CreateSession() (string, error) {
+func (s *Store) CreateSession(userID int64) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(b)
-	_, err := s.db.Exec(`INSERT INTO sessions (token, expires_at) VALUES (?, ?)`, token, time.Now().Add(sessionTTL))
+	_, err := s.db.Exec(`INSERT INTO sessions (token, expires_at, user_id) VALUES (?, ?, ?)`, token, time.Now().Add(sessionTTL), userID)
 	return token, err
+}
+
+func (s *Store) GetUserIDFromSession(token string) (userID int64, role string, err error) {
+	var expiresAt time.Time
+	err = s.db.QueryRow(`
+		SELECT s.user_id, u.role, s.expires_at
+		FROM sessions s
+		JOIN users u ON u.id = s.user_id
+		WHERE s.token = ?`, token).Scan(&userID, &role, &expiresAt)
+	if err == sql.ErrNoRows {
+		return 0, "", fmt.Errorf("session not found")
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if time.Now().After(expiresAt) {
+		s.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+		return 0, "", fmt.Errorf("session expired")
+	}
+	return userID, role, nil
 }
 
 func (s *Store) ValidateSession(token string) bool {
@@ -471,6 +638,8 @@ type RequestFilter struct {
 	Search         string
 	Classification string
 	Model          string
+	Since          time.Time
+	Until          time.Time
 }
 
 func (s *Store) ListRequestsFiltered(limit, offset int, f RequestFilter) ([]RequestRecord, error) {
@@ -487,6 +656,14 @@ func (s *Store) ListRequestsFiltered(limit, offset int, f RequestFilter) ([]Requ
 	if f.Model != "" {
 		q += ` AND model = ?`
 		args = append(args, f.Model)
+	}
+	if !f.Since.IsZero() {
+		q += ` AND timestamp >= ?`
+		args = append(args, f.Since)
+	}
+	if !f.Until.IsZero() {
+		q += ` AND timestamp <= ?`
+		args = append(args, f.Until)
 	}
 	q += ` ORDER BY timestamp DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
@@ -524,6 +701,14 @@ func (s *Store) CountRequestsFiltered(f RequestFilter) (int64, error) {
 	if f.Model != "" {
 		q += ` AND model = ?`
 		args = append(args, f.Model)
+	}
+	if !f.Since.IsZero() {
+		q += ` AND timestamp >= ?`
+		args = append(args, f.Since)
+	}
+	if !f.Until.IsZero() {
+		q += ` AND timestamp <= ?`
+		args = append(args, f.Until)
 	}
 	var count int64
 	err := s.db.QueryRow(q, args...).Scan(&count)
@@ -612,4 +797,24 @@ func (s *Store) RecordLoginFailure(key string) (locked bool, err error) {
 // ClearLoginFailures resets the counter for key on successful login.
 func (s *Store) ClearLoginFailures(key string) {
 	s.db.Exec(`DELETE FROM login_attempts WHERE key = ?`, key)
+}
+
+// Close closes the underlying database connection.
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+// Ping checks that the database is reachable.
+func (s *Store) Ping() error {
+	return s.db.Ping()
+}
+
+// CleanupLoginAttempts removes expired lockouts and stale entries.
+func (s *Store) CleanupLoginAttempts() {
+	if res, err := s.db.Exec(`DELETE FROM login_attempts WHERE (locked_until IS NOT NULL AND locked_until < ?) OR (updated_at < ?)`,
+		time.Now(), time.Now().Add(-24*time.Hour)); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("cleaned up %d stale login_attempts", n)
+		}
+	}
 }

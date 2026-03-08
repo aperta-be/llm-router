@@ -1,4 +1,4 @@
-module llm-router
+module github.com/aperta-be/llm-router
 
 go 1.25.7
 

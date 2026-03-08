@@ -7,9 +7,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"llm-router/router"
-	"llm-router/store"
+	"github.com/aperta-be/llm-router/router"
+	"github.com/aperta-be/llm-router/store"
 )
+
+// Version is set at build time via -ldflags.
+var Version = "dev"
 
 type Handler struct {
 	router *router.Router
@@ -55,7 +58,9 @@ func (h *Handler) Chat(c *gin.Context) {
 	c.Header("X-Router-Classification", taskType)
 	c.Header("X-Router-Model", model)
 
-	h.router.ForwardRequest(cfg.OllamaBaseURL, model, req, c.Writer, req.Stream)
+	requestID, _ := c.Get("request_id")
+	reqID, _ := requestID.(string)
+	h.router.ForwardRequest(cfg.OllamaBaseURL, model, req, c.Writer, req.Stream, reqID)
 
 	latency := time.Since(start).Milliseconds()
 	go func() {
@@ -66,7 +71,37 @@ func (h *Handler) Chat(c *gin.Context) {
 }
 
 func (h *Handler) Health(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	result := gin.H{
+		"status":  "ok",
+		"version": Version,
+	}
+
+	// Check DB
+	if err := h.store.Ping(); err != nil {
+		result["status"] = "degraded"
+		result["db"] = "unreachable"
+	} else {
+		result["db"] = "ok"
+	}
+
+	// Check Ollama
+	cfg, err := h.store.GetConfig()
+	if err == nil {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(cfg.OllamaBaseURL + "/api/tags")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			result["status"] = "degraded"
+			result["ollama"] = "unreachable"
+		} else {
+			resp.Body.Close()
+			result["ollama"] = "ok"
+		}
+	} else {
+		result["status"] = "degraded"
+		result["ollama"] = "unknown"
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 func (h *Handler) Models(c *gin.Context) {

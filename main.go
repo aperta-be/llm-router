@@ -11,14 +11,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"llm-router/config"
-	"llm-router/handlers"
-	"llm-router/middleware"
-	"llm-router/router"
-	"llm-router/store"
+	"github.com/aperta-be/llm-router/config"
+	"github.com/aperta-be/llm-router/handlers"
+	"github.com/aperta-be/llm-router/middleware"
+	"github.com/aperta-be/llm-router/router"
+	"github.com/aperta-be/llm-router/store"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=..."
+var Version = "dev"
+
 func main() {
+	// Propagate version to handlers
+	handlers.Version = Version
+
 	cfg := config.Load()
 
 	db, err := store.New(cfg.DBPath)
@@ -44,9 +50,16 @@ func main() {
 	r.Use(middleware.Logger())
 	r.Use(gin.Recovery())
 
+	// Request body size limit (10 MB)
+	r.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 10<<20)
+		c.Next()
+	})
+
 	// API routes
 	r.GET("/health", h.Health)
 	r.GET("/models", h.Models)
+	r.GET("/v1/models", h.Models)
 	r.POST("/v1/chat/completions", middleware.APIKeyAuth(db), h.Chat)
 	r.POST("/v1/classify", middleware.APIKeyAuth(db), h.Classify)
 
@@ -54,22 +67,30 @@ func main() {
 	r.GET("/admin/login", admin.LoginPage)
 	r.POST("/admin/login", admin.LoginSubmit)
 
-	// Admin: authenticated
-	authed := r.Group("/admin", middleware.AdminAuth(db))
+	// Admin: authenticated (any role)
+	authed := r.Group("/admin", middleware.UserAuth(db))
 	{
-		authed.GET("/", func(c *gin.Context) {
-			c.Redirect(302, "/admin/dashboard")
-		})
 		authed.GET("/logout", admin.Logout)
-		authed.GET("/dashboard", admin.Dashboard)
-		authed.GET("/config", admin.ConfigPage)
-		authed.POST("/config", admin.ConfigSave)
-		authed.GET("/test-connection", admin.TestConnection)
 		authed.GET("/keys", admin.KeysPage)
 		authed.POST("/keys", admin.KeyCreate)
 		authed.POST("/keys/:id/revoke", admin.KeyRevoke)
-		authed.GET("/prompts", admin.PromptsPage)
-		authed.GET("/prompts/export", admin.PromptsExport)
+	}
+
+	// Admin: admin-only routes
+	adminOnly := r.Group("/admin", middleware.UserAuth(db), middleware.RequireAdmin())
+	{
+		adminOnly.GET("/", func(c *gin.Context) {
+			c.Redirect(302, "/admin/dashboard")
+		})
+		adminOnly.GET("/dashboard", admin.Dashboard)
+		adminOnly.GET("/config", admin.ConfigPage)
+		adminOnly.POST("/config", admin.ConfigSave)
+		adminOnly.GET("/test-connection", admin.TestConnection)
+		adminOnly.GET("/prompts", admin.PromptsPage)
+		adminOnly.GET("/prompts/export", admin.PromptsExport)
+		adminOnly.GET("/users", admin.UsersPage)
+		adminOnly.POST("/users", admin.UserCreate)
+		adminOnly.POST("/users/:id/toggle", admin.UserToggle)
 	}
 
 	srv := &http.Server{
@@ -77,8 +98,24 @@ func main() {
 		Handler: r,
 	}
 
+	// Periodic cleanup goroutine
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
 	go func() {
-		log.Printf("llm-router starting on :%s (ollama: %s, db: %s)", cfg.Port, cfg.OllamaBaseURL, cfg.DBPath)
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				db.CleanupSessions()
+				db.CleanupLoginAttempts()
+			case <-cleanupCtx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		log.Printf("llm-router %s starting on :%s (ollama: %s, db: %s)", Version, cfg.Port, cfg.OllamaBaseURL, cfg.DBPath)
 		log.Printf("admin panel: http://localhost:%s/admin", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server error: %v", err)
@@ -95,5 +132,12 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("forced shutdown: %v", err)
 	}
+
+	cleanupCancel()
+
+	if err := db.Close(); err != nil {
+		log.Printf("close db: %v", err)
+	}
+
 	log.Println("server stopped")
 }

@@ -4,16 +4,17 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"llm-router/store"
+	"github.com/aperta-be/llm-router/store"
 )
 
 //go:embed templates/*.html
@@ -91,7 +92,7 @@ func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 		return
 	}
 
-	ok, err := h.store.AuthenticateUser(username, password)
+	userID, role, ok, err := h.store.AuthenticateUser(username, password)
 	if err != nil || !ok {
 		h.store.RecordLoginFailure(lockKey)
 		h.store.RecordLoginFailure(ipKey)
@@ -105,20 +106,38 @@ func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 	h.store.ClearLoginFailures(lockKey)
 	h.store.ClearLoginFailures(ipKey)
 
-	token, err := h.store.CreateSession()
+	token, err := h.store.CreateSession(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "session error"})
 		return
 	}
-	c.SetCookie(sessionCookie, token, 86400, "/", "", false, true)
-	c.Redirect(http.StatusFound, "/admin/dashboard")
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		MaxAge:   86400,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	if role == "admin" {
+		c.Redirect(http.StatusFound, "/admin/dashboard")
+	} else {
+		c.Redirect(http.StatusFound, "/admin/keys")
+	}
 }
 
 func (h *AdminHandler) Logout(c *gin.Context) {
 	if token, err := c.Cookie(sessionCookie); err == nil {
 		h.store.DeleteSession(token)
 	}
-	c.SetCookie(sessionCookie, "", -1, "/", "", false, true)
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		MaxAge:   -1,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 	c.Redirect(http.StatusFound, "/admin/login")
 }
 
@@ -131,6 +150,7 @@ type periodOption struct {
 
 type dashboardData struct {
 	Page    string
+	Role    string
 	Stats   store.Stats
 	Recent  []store.RequestRecord
 	Period  string
@@ -159,6 +179,7 @@ func (h *AdminHandler) Dashboard(c *gin.Context) {
 	}
 	h.render(c, "dashboard.html", dashboardData{
 		Page:    "dashboard",
+		Role:    c.GetString("user_role"),
 		Stats:   stats,
 		Recent:  recent,
 		Period:  period,
@@ -185,9 +206,11 @@ func periodToTime(period string) time.Time {
 // --- Config ---
 
 type configData struct {
-	Page  string
-	Cfg   store.AppConfig
-	Saved bool
+	Page   string
+	Role   string
+	Cfg    store.AppConfig
+	Saved  bool
+	Errors []string
 }
 
 func (h *AdminHandler) ConfigPage(c *gin.Context) {
@@ -195,72 +218,143 @@ func (h *AdminHandler) ConfigPage(c *gin.Context) {
 	if err != nil {
 		log.Printf("get config: %v", err)
 	}
-	h.render(c, "config.html", configData{Page: "config", Cfg: cfg})
+	h.render(c, "config.html", configData{Page: "config", Role: c.GetString("user_role"), Cfg: cfg})
 }
 
 func (h *AdminHandler) ConfigSave(c *gin.Context) {
 	fields := map[string]string{
-		"ollama_base_url":  c.PostForm("ollama_base_url"),
-		"classifier_model": c.PostForm("classifier_model"),
-		"thinking_model":   c.PostForm("thinking_model"),
-		"coding_model":     c.PostForm("coding_model"),
-		"simple_model":     c.PostForm("simple_model"),
-		"default_model":         c.PostForm("default_model"),
+		"ollama_base_url":        c.PostForm("ollama_base_url"),
+		"classifier_model":       c.PostForm("classifier_model"),
+		"thinking_model":         c.PostForm("thinking_model"),
+		"coding_model":           c.PostForm("coding_model"),
+		"simple_model":           c.PostForm("simple_model"),
+		"default_model":          c.PostForm("default_model"),
 		"classification_prompt":  c.PostForm("classification_prompt"),
-		"classifier_timeout_s":  c.PostForm("classifier_timeout_s"),
-		"cache_ttl_s":           c.PostForm("cache_ttl_s"),
-		"cache_max_size":        c.PostForm("cache_max_size"),
+		"classifier_timeout_s":   c.PostForm("classifier_timeout_s"),
+		"cache_ttl_s":            c.PostForm("cache_ttl_s"),
+		"cache_max_size":         c.PostForm("cache_max_size"),
 	}
+
+	var errs []string
+
+	// Validate URL format for ollama_base_url
+	if v := fields["ollama_base_url"]; v != "" {
+		if u, err := url.Parse(v); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, "Ollama Base URL must be a valid http(s) URL")
+		}
+	}
+
+	// Validate model names are non-empty
+	for _, key := range []string{"classifier_model", "thinking_model", "coding_model", "simple_model", "default_model"} {
+		if fields[key] == "" {
+			errs = append(errs, fmt.Sprintf("%s cannot be empty", key))
+		}
+	}
+
+	// Validate positive integers for numeric fields
+	for _, key := range []string{"classifier_timeout_s", "cache_ttl_s", "cache_max_size"} {
+		if v := fields[key]; v != "" {
+			if n, err := strconv.Atoi(v); err != nil || n <= 0 {
+				errs = append(errs, fmt.Sprintf("%s must be a positive integer", key))
+			}
+		}
+	}
+
+	role := c.GetString("user_role")
+	if len(errs) > 0 {
+		cfg, _ := h.store.GetConfig()
+		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Errors: errs})
+		return
+	}
+
 	for k, v := range fields {
-		
 		if v == "" {
 			continue
 		}
 		if err := h.store.SetConfigValue(k, v); err != nil {
 			log.Printf("set config %s: %v", k, err)
+			errs = append(errs, fmt.Sprintf("Failed to save %s: %v", k, err))
 		}
 	}
 
 	cfg, _ := h.store.GetConfig()
-	h.render(c, "config.html", configData{Page: "config", Cfg: cfg, Saved: true})
+	if len(errs) > 0 {
+		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Errors: errs})
+		return
+	}
+	h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Saved: true})
 }
 
 // --- API Keys ---
 
 type keysData struct {
 	Page   string
+	Role   string
 	Keys   []store.APIKey
 	NewKey string
 	Error  string
 }
 
+type usersData struct {
+	Page  string
+	Role  string
+	Users []store.User
+	Error string
+	Saved bool
+}
+
 func (h *AdminHandler) KeysPage(c *gin.Context) {
-	keys, err := h.store.ListAPIKeys()
+	role := c.GetString("user_role")
+	uid, _ := c.Get("user_id")
+	userID, _ := uid.(int64)
+
+	var keys []store.APIKey
+	var err error
+	if role == "admin" {
+		keys, err = h.store.ListAPIKeys()
+	} else {
+		keys, err = h.store.ListAPIKeysByUser(userID)
+	}
 	if err != nil {
 		log.Printf("list keys: %v", err)
 	}
 	h.render(c, "keys.html", keysData{
 		Page:   "keys",
+		Role:   role,
 		Keys:   keys,
 		NewKey: c.Query("new_key"),
 	})
 }
 
 func (h *AdminHandler) KeyCreate(c *gin.Context) {
+	role := c.GetString("user_role")
+	uid, _ := c.Get("user_id")
+	userID, _ := uid.(int64)
+
 	name := c.PostForm("name")
 	if name == "" {
-		keys, _ := h.store.ListAPIKeys()
-		h.render(c, "keys.html", keysData{Page: "keys", Keys: keys, Error: "Key name is required."})
+		var keys []store.APIKey
+		if role == "admin" {
+			keys, _ = h.store.ListAPIKeys()
+		} else {
+			keys, _ = h.store.ListAPIKeysByUser(userID)
+		}
+		h.render(c, "keys.html", keysData{Page: "keys", Role: role, Keys: keys, Error: "Key name is required."})
 		return
 	}
 
 	expiryDays, _ := strconv.Atoi(c.PostForm("expiry_days"))
 
-	rawKey, err := h.store.CreateAPIKey(name, expiryDays)
+	rawKey, err := h.store.CreateAPIKeyForUser(name, expiryDays, userID)
 	if err != nil {
 		log.Printf("create key: %v", err)
-		keys, _ := h.store.ListAPIKeys()
-		h.render(c, "keys.html", keysData{Page: "keys", Keys: keys, Error: "Failed to create key."})
+		var keys []store.APIKey
+		if role == "admin" {
+			keys, _ = h.store.ListAPIKeys()
+		} else {
+			keys, _ = h.store.ListAPIKeysByUser(userID)
+		}
+		h.render(c, "keys.html", keysData{Page: "keys", Role: role, Keys: keys, Error: "Failed to create key."})
 		return
 	}
 
@@ -273,7 +367,15 @@ func (h *AdminHandler) KeyRevoke(c *gin.Context) {
 		c.Redirect(http.StatusFound, "/admin/keys")
 		return
 	}
-	if err := h.store.RevokeAPIKey(id); err != nil {
+	role := c.GetString("user_role")
+	uid, _ := c.Get("user_id")
+	userID, _ := uid.(int64)
+
+	var revokeUserID int64
+	if role != "admin" {
+		revokeUserID = userID
+	}
+	if err := h.store.RevokeAPIKeyForUser(id, revokeUserID); err != nil {
 		log.Printf("revoke key %d: %v", id, err)
 	}
 	c.Redirect(http.StatusFound, "/admin/keys")
@@ -283,6 +385,7 @@ func (h *AdminHandler) KeyRevoke(c *gin.Context) {
 
 type promptsData struct {
 	Page           string
+	Role           string
 	Requests       []store.RequestRecord
 	Total          int64
 	Pages          int
@@ -300,8 +403,12 @@ func (h *AdminHandler) PromptsPage(c *gin.Context) {
 	}
 	offset := (page - 1) * perPage
 
+	search := c.Query("search")
+	if len(search) > 500 {
+		search = search[:500]
+	}
 	f := store.RequestFilter{
-		Search:         c.Query("search"),
+		Search:         search,
 		Classification: c.Query("classification"),
 		Model:          c.Query("model"),
 	}
@@ -319,6 +426,7 @@ func (h *AdminHandler) PromptsPage(c *gin.Context) {
 
 	h.render(c, "prompts.html", promptsData{
 		Page:           "prompts",
+		Role:           c.GetString("user_role"),
 		Requests:       requests,
 		Total:          total,
 		Pages:          pages,
@@ -332,12 +440,27 @@ func (h *AdminHandler) PromptsPage(c *gin.Context) {
 
 // --- Export ---
 
+func parseExportTime(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
 func (h *AdminHandler) PromptsExport(c *gin.Context) {
 	format := c.DefaultQuery("format", "json")
 	f := store.RequestFilter{
 		Search:         c.Query("search"),
 		Classification: c.Query("classification"),
 		Model:          c.Query("model"),
+		Since:          parseExportTime(c.Query("from")),
+		Until:          parseExportTime(c.Query("to")),
 	}
 
 	records, err := h.store.AllRequests(f)
@@ -374,6 +497,79 @@ func (h *AdminHandler) PromptsExport(c *gin.Context) {
 		c.Header("Content-Disposition", `attachment; filename="requests.json"`)
 		c.JSON(http.StatusOK, records)
 	}
+}
+
+// --- User Management ---
+
+func (h *AdminHandler) UsersPage(c *gin.Context) {
+	users, err := h.store.ListUsers()
+	if err != nil {
+		log.Printf("list users: %v", err)
+	}
+	h.render(c, "users.html", usersData{
+		Page:  "users",
+		Role:  c.GetString("user_role"),
+		Users: users,
+	})
+}
+
+func (h *AdminHandler) UserCreate(c *gin.Context) {
+	username := c.PostForm("username")
+	password := c.PostForm("password")
+	role := c.PostForm("role")
+
+	if role != "admin" && role != "user" {
+		role = "user"
+	}
+
+	if username == "" || password == "" {
+		users, _ := h.store.ListUsers()
+		h.render(c, "users.html", usersData{
+			Page:  "users",
+			Role:  c.GetString("user_role"),
+			Users: users,
+			Error: "Username and password are required.",
+		})
+		return
+	}
+
+	if err := h.store.CreateUser(username, password, role); err != nil {
+		log.Printf("create user: %v", err)
+		users, _ := h.store.ListUsers()
+		h.render(c, "users.html", usersData{
+			Page:  "users",
+			Role:  c.GetString("user_role"),
+			Users: users,
+			Error: "Failed to create user (username may already exist).",
+		})
+		return
+	}
+
+	users, _ := h.store.ListUsers()
+	h.render(c, "users.html", usersData{
+		Page:  "users",
+		Role:  c.GetString("user_role"),
+		Users: users,
+		Saved: true,
+	})
+}
+
+func (h *AdminHandler) UserToggle(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.Redirect(http.StatusFound, "/admin/users")
+		return
+	}
+	user, err := h.store.GetUserByID(id)
+	if err != nil {
+		log.Printf("get user %d: %v", id, err)
+		c.Redirect(http.StatusFound, "/admin/users")
+		return
+	}
+	if err := h.store.SetUserActive(id, !user.Active); err != nil {
+		log.Printf("toggle user %d: %v", id, err)
+	}
+	c.Redirect(http.StatusFound, "/admin/users")
 }
 
 // --- Test Connection ---

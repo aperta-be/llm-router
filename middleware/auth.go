@@ -6,7 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"llm-router/store"
+	"github.com/aperta-be/llm-router/store"
 )
 
 const sessionCookie = "llmr_session"
@@ -37,16 +37,37 @@ func APIKeyAuth(s *store.Store) gin.HandlerFunc {
 	}
 }
 
-// AdminAuth enforces session cookie validation on admin routes.
-func AdminAuth(s *store.Store) gin.HandlerFunc {
+// UserAuth validates the session cookie and sets user_id and user_role in gin context.
+func UserAuth(s *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, err := c.Cookie(sessionCookie)
-		if err != nil || !s.ValidateSession(token) {
+		if err != nil {
+			c.Redirect(http.StatusFound, "/admin/login")
+			c.Abort()
+			return
+		}
+		userID, role, err := s.GetUserIDFromSession(token)
+		if err != nil {
 			c.Redirect(http.StatusFound, "/admin/login")
 			c.Abort()
 			return
 		}
 		c.Set("session_token", token)
+		c.Set("user_id", userID)
+		c.Set("user_role", role)
+		c.Next()
+	}
+}
+
+// RequireAdmin aborts with a redirect if the user is not an admin.
+// Must be used after UserAuth.
+func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("user_role") != "admin" {
+			c.Redirect(http.StatusFound, "/admin/keys")
+			c.Abort()
+			return
+		}
 		c.Next()
 	}
 }

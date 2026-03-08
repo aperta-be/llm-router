@@ -37,18 +37,37 @@ Response headers expose the routing decision:
 
 ---
 
-## Quick Start
+## Quick Start (Docker)
 
-**Prerequisites:** Go 1.21+, Ollama running locally.
+**Prerequisites:** Docker, Ollama running locally (or use docker-compose to run both).
 
 ```bash
-git clone <repo>
+# With docker-compose (starts Ollama + llm-router)
+docker compose up -d
+
+# Or run the router container only (Ollama already running)
+docker run -d \
+  -p 8080:8080 \
+  -v llmr_data:/data \
+  -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+  -e ADMIN_PASSWORD=changeme \
+  ghcr.io/aperta-be/llm-router:latest
+```
+
+The server starts on `:8080`. Admin panel at `http://localhost:8080/admin` (default credentials: `admin` / `changeme`).
+
+---
+
+## Quick Start (Go)
+
+**Prerequisites:** Go 1.25+, Ollama running locally.
+
+```bash
+git clone https://github.com/aperta-be/llm-router
 cd llm-router
 go build -o llm-router .
 ./llm-router
 ```
-
-The server starts on `:8080`. Admin panel at `http://localhost:8080/admin` (default credentials: `admin` / `admin`).
 
 ### Environment Variables
 
@@ -126,6 +145,24 @@ Returns the currently configured model for each role.
 | Config | `/admin/config` | Ollama URL, model assignments, classification prompt, cache settings. Includes a **Test Connection** button that pings Ollama and shows which configured models are available |
 | API Keys | `/admin/keys` | Create / revoke API keys with optional expiry (7d / 30d / 90d / 1y) |
 | Prompt History | `/admin/prompts` | Search, filter by classification / model, paginate, export to CSV or JSON |
+| Users | `/admin/users` | Create users, assign roles (admin / user), enable or disable accounts |
+
+---
+
+## User Management
+
+The router supports multiple users with two roles:
+
+| Role | Access |
+|------|--------|
+| `admin` | Full admin panel access: config, dashboard, prompt history, user management |
+| `user` | Self-service only: create and revoke their own API keys |
+
+**Creating users:** Admins can create additional accounts from `/admin/users`. Users can be enabled or disabled without deletion.
+
+**Self-service API keys:** Non-admin users log in at `/admin/login` and can manage their own API keys at `/admin/keys`. They have no access to config, dashboard, or other users' keys.
+
+**First-run:** A default admin account is created from `ADMIN_USERNAME` / `ADMIN_PASSWORD` on startup.
 
 ---
 

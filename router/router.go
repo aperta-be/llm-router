@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"llm-router/store"
+	"github.com/aperta-be/llm-router/store"
 )
 
 type ChatMessage struct {
@@ -23,9 +23,14 @@ type ChatMessage struct {
 }
 
 type ChatRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model       string            `json:"model"`
+	Messages    []ChatMessage     `json:"messages"`
+	Stream      bool              `json:"stream"`
+	Temperature *float64          `json:"temperature,omitempty"`
+	MaxTokens   *int              `json:"max_tokens,omitempty"`
+	TopP        *float64          `json:"top_p,omitempty"`
+	Stop        json.RawMessage   `json:"stop,omitempty"`
+	Tools       json.RawMessage   `json:"tools,omitempty"`
 }
 
 type chatChoice struct {
@@ -93,7 +98,7 @@ type Router struct {
 func New(s *store.Store) *Router {
 	return &Router{
 		store:  s,
-		client: &http.Client{},
+		client: &http.Client{Timeout: 5 * time.Minute},
 		cache:  newCache(),
 	}
 }
@@ -198,7 +203,7 @@ func SelectModel(taskType string, cfg store.AppConfig) string {
 }
 
 // ForwardRequest proxies the request to Ollama, supporting both streaming and non-streaming.
-func (r *Router) ForwardRequest(ollamaURL, model string, origReq ChatRequest, w http.ResponseWriter, streaming bool) {
+func (r *Router) ForwardRequest(ollamaURL, model string, origReq ChatRequest, w http.ResponseWriter, streaming bool, requestID string) {
 	origReq.Model = model
 
 	body, err := json.Marshal(origReq)
@@ -213,6 +218,9 @@ func (r *Router) ForwardRequest(ollamaURL, model string, origReq ChatRequest, w 
 		return
 	}
 	upstreamReq.Header.Set("Content-Type", "application/json")
+	if requestID != "" {
+		upstreamReq.Header.Set("X-Request-ID", requestID)
+	}
 
 	resp, err := r.client.Do(upstreamReq)
 	if err != nil {
