@@ -44,11 +44,11 @@
     /* Forms */
     .form-group { margin-bottom: 18px; }
     label { display: block; font-size: 13px; font-weight: 500; color: #475569; margin-bottom: 6px; }
-    input[type=text], input[type=password], input[type=url] {
+    input[type=text], input[type=password], input[type=url], select {
       width: 100%; padding: 9px 12px; border: 1px solid #e2e8f0; border-radius: 7px;
       font-size: 14px; color: #0f172a; background: #f8fafc; transition: border 0.15s;
     }
-    input:focus { outline: none; border-color: #818cf8; background: #fff; }
+    input:focus, select:focus { outline: none; border-color: #818cf8; background: #fff; }
 
     /* Buttons */
     .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 7px; font-size: 14px; font-weight: 500; cursor: pointer; border: none; text-decoration: none; transition: opacity 0.15s; }
@@ -90,16 +90,25 @@
   <nav class="topbar">
     <span class="brand">⚡ <span>LLM</span> Router</span>
     <div class="nav-links">
+      {{if eq .Role "admin"}}
       <a href="/admin/dashboard" {{if eq .Page "dashboard"}}class="active"{{end}}>Dashboard</a>
       <a href="/admin/config"    {{if eq .Page "config"}}class="active"{{end}}>Config</a>
-      <a href="/admin/keys"      {{if eq .Page "keys"}}class="active"{{end}}>API Keys</a>
-      <a href="/admin/prompts"   {{if eq .Page "prompts"}}class="active"{{end}}>Prompts</a>
+      {{end}}
+      <a href="/admin/keys" {{if eq .Page "keys"}}class="active"{{end}}>{{if eq .Role "admin"}}API Keys{{else}}My Keys{{end}}</a>
+      {{if eq .Role "admin"}}
+      <a href="/admin/prompts"    {{if eq .Page "prompts"}}class="active"{{end}}>Prompts</a>
+      <a href="/admin/providers"  {{if eq .Page "providers"}}class="active"{{end}}>Providers</a>
+      <a href="/admin/users"      {{if eq .Page "users"}}class="active"{{end}}>Users</a>
+      {{end}}
       <a href="/admin/logout" class="logout">Logout</a>
     </div>
   </nav>
   <div class="container">
     {{template "content" .}}
   </div>
+  <footer style="text-align:center;padding:24px;font-size:12px;color:#94a3b8">
+    Built with ♥ by <a href="https://aperta.be" target="_blank" style="color:#818cf8;text-decoration:none">aperta.be</a>
+  </footer>
 </body>
 </html>
 {{end}}

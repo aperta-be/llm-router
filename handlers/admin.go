@@ -47,6 +47,15 @@ func (h *AdminHandler) render(c *gin.Context, pageName string, data any) {
 			}
 			return s
 		},
+		"maskKey": func(key string) string {
+			if key == "" {
+				return ""
+			}
+			if len(key) <= 8 {
+				return "••••••••"
+			}
+			return key[:7] + "…"
+		},
 	}
 	tmpl, err := template.New("").Funcs(funcMap).ParseFS(templateFS, "templates/base.html", "templates/"+pageName)
 	if err != nil {
@@ -206,11 +215,12 @@ func periodToTime(period string) time.Time {
 // --- Config ---
 
 type configData struct {
-	Page   string
-	Role   string
-	Cfg    store.AppConfig
-	Saved  bool
-	Errors []string
+	Page      string
+	Role      string
+	Cfg       store.AppConfig
+	Providers []store.Provider
+	Saved     bool
+	Errors    []string
 }
 
 func (h *AdminHandler) ConfigPage(c *gin.Context) {
@@ -218,7 +228,8 @@ func (h *AdminHandler) ConfigPage(c *gin.Context) {
 	if err != nil {
 		log.Printf("get config: %v", err)
 	}
-	h.render(c, "config.html", configData{Page: "config", Role: c.GetString("user_role"), Cfg: cfg})
+	providers, _ := h.store.ListProviders()
+	h.render(c, "config.html", configData{Page: "config", Role: c.GetString("user_role"), Cfg: cfg, Providers: providers})
 }
 
 func (h *AdminHandler) ConfigSave(c *gin.Context) {
@@ -233,6 +244,10 @@ func (h *AdminHandler) ConfigSave(c *gin.Context) {
 		"classifier_timeout_s":   c.PostForm("classifier_timeout_s"),
 		"cache_ttl_s":            c.PostForm("cache_ttl_s"),
 		"cache_max_size":         c.PostForm("cache_max_size"),
+		"thinking_provider_id":   c.PostForm("thinking_provider_id"),
+		"coding_provider_id":     c.PostForm("coding_provider_id"),
+		"simple_provider_id":     c.PostForm("simple_provider_id"),
+		"default_provider_id":    c.PostForm("default_provider_id"),
 	}
 
 	var errs []string
@@ -263,7 +278,8 @@ func (h *AdminHandler) ConfigSave(c *gin.Context) {
 	role := c.GetString("user_role")
 	if len(errs) > 0 {
 		cfg, _ := h.store.GetConfig()
-		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Errors: errs})
+		providers, _ := h.store.ListProviders()
+		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, Errors: errs})
 		return
 	}
 
@@ -278,11 +294,12 @@ func (h *AdminHandler) ConfigSave(c *gin.Context) {
 	}
 
 	cfg, _ := h.store.GetConfig()
+	providers, _ := h.store.ListProviders()
 	if len(errs) > 0 {
-		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Errors: errs})
+		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, Errors: errs})
 		return
 	}
-	h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Saved: true})
+	h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, Saved: true})
 }
 
 // --- API Keys ---
@@ -570,6 +587,123 @@ func (h *AdminHandler) UserToggle(c *gin.Context) {
 		log.Printf("toggle user %d: %v", id, err)
 	}
 	c.Redirect(http.StatusFound, "/admin/users")
+}
+
+// --- Providers ---
+
+type providersData struct {
+	Page      string
+	Role      string
+	Providers []store.Provider
+	Error     string
+	Saved     bool
+}
+
+func (h *AdminHandler) ProvidersPage(c *gin.Context) {
+	providers, err := h.store.ListProviders()
+	if err != nil {
+		log.Printf("list providers: %v", err)
+	}
+	h.render(c, "providers.html", providersData{
+		Page:      "providers",
+		Role:      c.GetString("user_role"),
+		Providers: providers,
+	})
+}
+
+func (h *AdminHandler) ProviderCreate(c *gin.Context) {
+	name := c.PostForm("name")
+	provType := c.PostForm("type")
+	baseURL := c.PostForm("base_url")
+	apiKey := c.PostForm("api_key")
+
+	providers, _ := h.store.ListProviders()
+	role := c.GetString("user_role")
+
+	if name == "" || baseURL == "" {
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: "Name and Base URL are required.",
+		})
+		return
+	}
+	if provType != "ollama" && provType != "openai" && provType != "anthropic" {
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: "Type must be ollama, openai, or anthropic.",
+		})
+		return
+	}
+	if u, err := url.Parse(baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: "Base URL must be a valid http(s) URL.",
+		})
+		return
+	}
+
+	if _, err := h.store.CreateProvider(name, provType, baseURL, apiKey); err != nil {
+		log.Printf("create provider: %v", err)
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: "Failed to create provider (name may already exist).",
+		})
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/providers")
+}
+
+func (h *AdminHandler) ProviderUpdate(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.Redirect(http.StatusFound, "/admin/providers")
+		return
+	}
+	name := c.PostForm("name")
+	provType := c.PostForm("type")
+	baseURL := c.PostForm("base_url")
+	apiKey := c.PostForm("api_key")
+
+	providers, _ := h.store.ListProviders()
+	role := c.GetString("user_role")
+
+	if name == "" || baseURL == "" {
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: "Name and Base URL are required.",
+		})
+		return
+	}
+
+	// If api_key field left blank, keep existing key.
+	if apiKey == "" {
+		existing, err := h.store.GetProvider(id)
+		if err == nil {
+			apiKey = existing.APIKey
+		}
+	}
+
+	if err := h.store.UpdateProvider(id, name, provType, baseURL, apiKey); err != nil {
+		log.Printf("update provider %d: %v", id, err)
+		h.render(c, "providers.html", providersData{
+			Page: "providers", Role: role, Providers: providers,
+			Error: fmt.Sprintf("Failed to update provider: %v", err),
+		})
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/providers")
+}
+
+func (h *AdminHandler) ProviderDelete(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.Redirect(http.StatusFound, "/admin/providers")
+		return
+	}
+	if err := h.store.DeleteProvider(id); err != nil {
+		log.Printf("delete provider %d: %v", id, err)
+	}
+	c.Redirect(http.StatusFound, "/admin/providers")
 }
 
 // --- Test Connection ---

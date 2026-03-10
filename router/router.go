@@ -190,34 +190,64 @@ func (r *Router) ClassifyTask(messages []ChatMessage) (taskType string, cfg stor
 
 // SelectModel picks the model for a given task type using the provided config.
 func SelectModel(taskType string, cfg store.AppConfig) string {
-	switch taskType {
-	case "thinking":
-		return cfg.ThinkingModel
-	case "coding":
-		return cfg.CodingModel
-	case "simple":
-		return cfg.SimpleModel
+	model, _ := SelectModelAndProvider(taskType, cfg)
+	return model
+}
+
+// FindProviderForModel returns the provider configured for the given model name,
+// falling back to the default provider if no exact match is found.
+func FindProviderForModel(model string, cfg store.AppConfig) store.Provider {
+	switch model {
+	case cfg.ThinkingModel:
+		return cfg.ThinkingProvider
+	case cfg.CodingModel:
+		return cfg.CodingProvider
+	case cfg.SimpleModel:
+		return cfg.SimpleProvider
 	default:
-		return cfg.DefaultModel
+		return cfg.DefaultProvider
 	}
 }
 
-// ForwardRequest proxies the request to Ollama, supporting both streaming and non-streaming.
-func (r *Router) ForwardRequest(ollamaURL, model string, origReq ChatRequest, w http.ResponseWriter, streaming bool, requestID string) {
+// SelectModelAndProvider picks the model and provider for a given task type.
+func SelectModelAndProvider(taskType string, cfg store.AppConfig) (model string, provider store.Provider) {
+	switch taskType {
+	case "thinking":
+		return cfg.ThinkingModel, cfg.ThinkingProvider
+	case "coding":
+		return cfg.CodingModel, cfg.CodingProvider
+	case "simple":
+		return cfg.SimpleModel, cfg.SimpleProvider
+	default:
+		return cfg.DefaultModel, cfg.DefaultProvider
+	}
+}
+
+// ForwardRequest proxies the request to the given provider, supporting both streaming and non-streaming.
+func (r *Router) ForwardRequest(provider store.Provider, model string, origReq ChatRequest, w http.ResponseWriter, streaming bool, requestID string) {
 	origReq.Model = model
 
+	if provider.Type == "anthropic" {
+		r.forwardAnthropic(provider, origReq, w, streaming, requestID)
+		return
+	}
+
+	// Ollama or OpenAI-compatible
 	body, err := json.Marshal(origReq)
 	if err != nil {
 		http.Error(w, `{"error":"failed to encode request"}`, http.StatusInternalServerError)
 		return
 	}
 
-	upstreamReq, err := http.NewRequest(http.MethodPost, ollamaURL+"/v1/chat/completions", bytes.NewReader(body))
+	upstreamReq, err := http.NewRequest(http.MethodPost, provider.BaseURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, `{"error":"failed to build upstream request"}`, http.StatusInternalServerError)
 		return
 	}
 	upstreamReq.Header.Set("Content-Type", "application/json")
+	if provider.APIKey != "" {
+		upstreamReq.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	}
 	if requestID != "" {
 		upstreamReq.Header.Set("X-Request-ID", requestID)
 	}
@@ -258,6 +288,207 @@ func (r *Router) ForwardRequest(ollamaURL, model string, origReq ChatRequest, w 
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 	}
+}
+
+// anthropicRequest is the Anthropic Messages API request body.
+type anthropicRequest struct {
+	Model     string             `json:"model"`
+	System    string             `json:"system,omitempty"`
+	Messages  []ChatMessage      `json:"messages"`
+	MaxTokens int                `json:"max_tokens"`
+	Stream    bool               `json:"stream"`
+}
+
+// forwardAnthropic translates an OpenAI-style request to Anthropic and translates the response back.
+func (r *Router) forwardAnthropic(provider store.Provider, origReq ChatRequest, w http.ResponseWriter, streaming bool, requestID string) {
+	// Separate system message from user/assistant messages.
+	var systemPrompt string
+	var msgs []ChatMessage
+	for _, m := range origReq.Messages {
+		if m.Role == "system" {
+			systemPrompt = m.Content
+		} else {
+			msgs = append(msgs, m)
+		}
+	}
+
+	aReq := anthropicRequest{
+		Model:     origReq.Model,
+		System:    systemPrompt,
+		Messages:  msgs,
+		MaxTokens: 8192,
+		Stream:    streaming,
+	}
+
+	body, err := json.Marshal(aReq)
+	if err != nil {
+		http.Error(w, `{"error":"failed to encode anthropic request"}`, http.StatusInternalServerError)
+		return
+	}
+
+	upstreamReq, err := http.NewRequest(http.MethodPost, provider.BaseURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, `{"error":"failed to build anthropic request"}`, http.StatusInternalServerError)
+		return
+	}
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("x-api-key", provider.APIKey)
+	upstreamReq.Header.Set("anthropic-version", "2023-06-01")
+	if requestID != "" {
+		upstreamReq.Header.Set("X-Request-ID", requestID)
+	}
+
+	resp, err := r.client.Do(upstreamReq)
+	if err != nil {
+		http.Error(w, `{"error":"anthropic upstream request failed"}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if streaming {
+		r.streamAnthropic(resp, w)
+	} else {
+		r.translateAnthropicResponse(resp, w)
+	}
+}
+
+// translateAnthropicResponse converts a non-streaming Anthropic response to OpenAI format.
+func (r *Router) translateAnthropicResponse(resp *http.Response, w http.ResponseWriter) {
+	var aResp struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		Model string `json:"model"`
+	}
+	rawBody, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(rawBody, &aResp); err != nil || len(aResp.Content) == 0 {
+		// Pass through as-is on error
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(rawBody)
+		return
+	}
+
+	oaiResp := map[string]any{
+		"choices": []map[string]any{
+			{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": aResp.Content[0].Text,
+				},
+				"finish_reason": "stop",
+				"index":         0,
+			},
+		},
+		"model":  aResp.Model,
+		"object": "chat.completion",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(oaiResp)
+}
+
+// streamAnthropic converts Anthropic SSE events to OpenAI SSE format.
+func (r *Router) streamAnthropic(resp *http.Response, w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, canFlush := w.(http.Flusher)
+
+	scanner := newLineScanner(resp.Body)
+	var eventType string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+
+		switch eventType {
+		case "content_block_delta":
+			var delta struct {
+				Delta struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &delta); err != nil || delta.Delta.Type != "text_delta" {
+				continue
+			}
+			chunk := map[string]any{
+				"choices": []map[string]any{
+					{"delta": map[string]string{"content": delta.Delta.Text}},
+				},
+			}
+			chunkJSON, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
+			if canFlush {
+				flusher.Flush()
+			}
+		case "message_stop":
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+	}
+	if scanner.Err() != nil {
+		log.Printf("anthropic stream scan error: %v", scanner.Err())
+	}
+}
+
+// newLineScanner returns a bufio.Scanner configured for line scanning.
+func newLineScanner(r io.Reader) *bufioScanner {
+	return &bufioScanner{r: r, buf: make([]byte, 0, 4096)}
+}
+
+type bufioScanner struct {
+	r   io.Reader
+	buf []byte
+	cur string
+	err error
+}
+
+func (s *bufioScanner) Scan() bool {
+	for {
+		// Look for \n in buf
+		for i, b := range s.buf {
+			if b == '\n' {
+				s.cur = string(s.buf[:i])
+				s.buf = s.buf[i+1:]
+				return true
+			}
+		}
+		// Read more data
+		tmp := make([]byte, 4096)
+		n, err := s.r.Read(tmp)
+		if n > 0 {
+			s.buf = append(s.buf, tmp[:n]...)
+		}
+		if err != nil {
+			if len(s.buf) > 0 {
+				s.cur = string(s.buf)
+				s.buf = nil
+				return true
+			}
+			s.err = err
+			return false
+		}
+	}
+}
+
+func (s *bufioScanner) Text() string { return s.cur }
+func (s *bufioScanner) Err() error {
+	if s.err == io.EOF {
+		return nil
+	}
+	return s.err
 }
 
 func msgHash(s string) string {

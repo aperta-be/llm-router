@@ -1,11 +1,24 @@
 {{define "content"}}
-<h1 class="page-title">API Keys</h1>
+<h1 class="page-title">{{if eq .Role "admin"}}API Keys{{else}}My API Keys{{end}}</h1>
 
 {{if .NewKey}}
 <div class="flash flash-key">
   <strong>New key created — copy it now, it won't be shown again:</strong><br><br>
-  {{.NewKey}}
+  <div style="display:flex;align-items:center;gap:8px">
+    <code id="new-key-value" style="word-break:break-all">{{.NewKey}}</code>
+    <button type="button" class="btn btn-sm" onclick="copyKey()" id="copy-key-btn" style="white-space:nowrap;font-size:12px;padding:4px 10px">Copy</button>
+  </div>
 </div>
+<script>
+function copyKey() {
+  var key = document.getElementById('new-key-value').textContent;
+  var btn = document.getElementById('copy-key-btn');
+  navigator.clipboard.writeText(key).then(function() {
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 2000);
+  });
+}
+</script>
 {{end}}
 {{if .Error}}<div class="flash flash-error">{{.Error}}</div>{{end}}
 
@@ -38,6 +51,7 @@
       <tr>
         <th>Name</th>
         <th>Preview</th>
+        {{if eq $.Role "admin"}}<th>Owner</th>{{end}}
         <th>Status</th>
         <th>Created</th>
         <th>Last Used</th>
@@ -50,6 +64,7 @@
       <tr>
         <td style="font-weight:500">{{.Name}}</td>
         <td class="mono" style="color:#64748b;font-size:13px">{{.KeyPreview}}…</td>
+        {{if eq $.Role "admin"}}<td style="font-size:13px;color:#64748b">{{if .OwnerName}}{{.OwnerName}}{{else}}—{{end}}</td>{{end}}
         <td>
           {{if .Active}}<span class="badge badge-active">active</span>
           {{else}}<span class="badge badge-revoked">revoked</span>{{end}}

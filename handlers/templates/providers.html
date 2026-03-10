@@ -1,0 +1,131 @@
+{{define "content"}}
+<h1 class="page-title">Providers</h1>
+
+{{if .Error}}<div class="flash flash-error">{{.Error}}</div>{{end}}
+{{if .Saved}}<div class="flash flash-success">Provider saved.</div>{{end}}
+
+<div class="card">
+  <div class="card-title">Add Provider</div>
+  <form method="POST" action="/admin/providers">
+    <div class="two-col">
+      <div class="form-group">
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" placeholder="e.g. OpenAI GPT-4" required>
+      </div>
+      <div class="form-group">
+        <label for="type">Type</label>
+        <select id="type" name="type" required onchange="prefillURL(this, 'base_url')">
+          <option value="ollama">Ollama</option>
+          <option value="openai">OpenAI-compatible</option>
+          <option value="anthropic">Anthropic</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="base_url">Base URL</label>
+        <input type="url" id="base_url" name="base_url" placeholder="http://localhost:11434" required>
+      </div>
+      <div class="form-group">
+        <label for="api_key">API Key <span style="font-weight:400;color:#94a3b8">(leave blank for Ollama)</span></label>
+        <input type="text" id="api_key" name="api_key" placeholder="sk-...">
+      </div>
+    </div>
+    <button type="submit" class="btn btn-primary">Add Provider</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">Configured Providers</div>
+  {{if .Providers}}
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Type</th>
+        <th>Base URL</th>
+        <th>API Key</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Providers}}
+      <tr>
+        <td class="mono" style="font-size:12px;color:#94a3b8">{{.ID}}</td>
+        <td><strong>{{.Name}}</strong></td>
+        <td><span class="badge {{if eq .Type "ollama"}}badge-simple{{else if eq .Type "openai"}}badge-coding{{else}}badge-thinking{{end}}">{{.Type}}</span></td>
+        <td class="mono" style="font-size:12px">{{.BaseURL}}</td>
+        <td class="mono" style="font-size:12px;color:#94a3b8">
+          {{if .APIKey}}{{maskKey .APIKey}}{{else}}<em style="color:#cbd5e1">none</em>{{end}}
+        </td>
+        <td>
+          <button onclick="toggleEdit({{.ID}})" class="btn btn-sm" style="background:#e2e8f0;color:#475569">Edit</button>
+          {{if ne .ID 1}}
+          <form method="POST" action="/admin/providers/{{.ID}}/delete" style="display:inline" onsubmit="return confirm('Delete this provider?')">
+            <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+          </form>
+          {{end}}
+        </td>
+      </tr>
+      <tr id="edit-{{.ID}}" style="display:none;background:#f8fafc">
+        <td colspan="6" style="padding:16px">
+          <form method="POST" action="/admin/providers/{{.ID}}">
+            <div class="two-col">
+              <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="name" value="{{.Name}}" required {{if eq .ID 1}}readonly{{end}}>
+              </div>
+              <div class="form-group">
+                <label>Type</label>
+                <select name="type" {{if eq .ID 1}}disabled{{end}}>
+                  <option value="ollama" {{if eq .Type "ollama"}}selected{{end}}>Ollama</option>
+                  <option value="openai" {{if eq .Type "openai"}}selected{{end}}>OpenAI-compatible</option>
+                  <option value="anthropic" {{if eq .Type "anthropic"}}selected{{end}}>Anthropic</option>
+                </select>
+                {{if eq .ID 1}}<input type="hidden" name="type" value="{{.Type}}">{{end}}
+              </div>
+              <div class="form-group">
+                <label>Base URL</label>
+                <input type="url" name="base_url" value="{{.BaseURL}}" required>
+              </div>
+              <div class="form-group">
+                <label>API Key <span style="font-weight:400;color:#94a3b8">(leave blank to keep current)</span></label>
+                <input type="text" name="api_key" placeholder="leave blank to keep">
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary">Save</button>
+            <button type="button" onclick="toggleEdit({{.ID}})" class="btn" style="background:#e2e8f0;color:#475569">Cancel</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p style="color:#94a3b8;font-size:14px">No providers configured yet.</p>
+  {{end}}
+</div>
+
+<script>
+var BASE_URLS = {
+  ollama:    'http://localhost:11434',
+  openai:    'https://api.openai.com',
+  anthropic: 'https://api.anthropic.com'
+};
+
+function prefillURL(select, urlInputId) {
+  var urlInput = document.getElementById(urlInputId);
+  if (!urlInput) return;
+  // Only overwrite if field is empty or was set by a previous prefill.
+  var current = urlInput.value;
+  var isPrefilled = Object.values(BASE_URLS).indexOf(current) !== -1 || current === '';
+  if (isPrefilled) {
+    urlInput.value = BASE_URLS[select.value] || '';
+  }
+}
+
+function toggleEdit(id) {
+  var row = document.getElementById('edit-' + id);
+  row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+}
+</script>
+{{end}}

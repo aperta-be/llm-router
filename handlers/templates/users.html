@@ -1,0 +1,72 @@
+{{define "content"}}
+<h1 class="page-title">User Management</h1>
+
+{{if .Error}}<div class="flash flash-error">{{.Error}}</div>{{end}}
+{{if .Saved}}<div class="flash flash-success">User created successfully.</div>{{end}}
+
+<div class="card" style="margin-bottom:20px">
+  <div class="card-title">Create New User</div>
+  <form method="POST" action="/admin/users" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div class="form-group" style="flex:2;min-width:160px;margin-bottom:0">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" placeholder="e.g. alice" required style="margin-bottom:0">
+    </div>
+    <div class="form-group" style="flex:2;min-width:160px;margin-bottom:0">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required style="margin-bottom:0">
+    </div>
+    <div class="form-group" style="flex:1;min-width:120px;margin-bottom:0">
+      <label for="role">Role</label>
+      <select id="role" name="role" style="padding:9px 10px;border:1px solid #e2e8f0;border-radius:7px;font-size:13px;width:100%">
+        <option value="user">User</option>
+        <option value="admin">Admin</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary" style="margin-bottom:0">Create User</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">All Users</div>
+  {{if .Users}}
+  <table>
+    <thead>
+      <tr>
+        <th>Username</th>
+        <th>Role</th>
+        <th>Status</th>
+        <th>Created</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Users}}
+      <tr>
+        <td style="font-weight:500">{{.Username}}</td>
+        <td>
+          {{if eq .Role "admin"}}<span class="badge badge-thinking">admin</span>
+          {{else}}<span class="badge badge-simple">user</span>{{end}}
+        </td>
+        <td>
+          {{if .Active}}<span class="badge badge-active">active</span>
+          {{else}}<span class="badge badge-revoked">disabled</span>{{end}}
+        </td>
+        <td style="font-size:13px;color:#64748b">{{.CreatedAt.Format "Jan 2, 2006"}}</td>
+        <td>
+          <form method="POST" action="/admin/users/{{.ID}}/toggle" style="display:inline">
+            {{if .Active}}
+            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Disable this user?')">Disable</button>
+            {{else}}
+            <button type="submit" class="btn btn-primary btn-sm">Enable</button>
+            {{end}}
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p style="color:#94a3b8;font-size:14px">No users yet. Create one above.</p>
+  {{end}}
+</div>
+{{end}}

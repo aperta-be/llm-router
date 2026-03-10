@@ -91,6 +91,10 @@ func main() {
 		adminOnly.GET("/users", admin.UsersPage)
 		adminOnly.POST("/users", admin.UserCreate)
 		adminOnly.POST("/users/:id/toggle", admin.UserToggle)
+		adminOnly.GET("/providers", admin.ProvidersPage)
+		adminOnly.POST("/providers", admin.ProviderCreate)
+		adminOnly.POST("/providers/:id", admin.ProviderUpdate)
+		adminOnly.POST("/providers/:id/delete", admin.ProviderDelete)
 	}
 
 	srv := &http.Server{

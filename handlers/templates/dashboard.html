@@ -88,7 +88,10 @@
         </td>
         <td class="mono" style="font-size:12px">{{.Model}}</td>
         <td class="prompt-cell">{{.Prompt}}</td>
-        <td style="white-space:nowrap">{{.LatencyMS}}ms</td>
+        <td style="white-space:nowrap">
+          {{.LatencyMS}}ms
+          {{if .CacheHit}}<span style="font-size:10px;color:#0369a1;font-weight:600;margin-left:4px" title="Classification served from cache">cached</span>{{end}}
+        </td>
       </tr>
       {{end}}
     </tbody>

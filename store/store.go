@@ -22,6 +22,14 @@ type Store struct {
 	db *sql.DB
 }
 
+type Provider struct {
+	ID      int
+	Name    string
+	Type    string // "ollama" | "openai" | "anthropic"
+	BaseURL string
+	APIKey  string
+}
+
 type AppConfig struct {
 	OllamaBaseURL        string
 	ClassifierModel      string
@@ -33,6 +41,10 @@ type AppConfig struct {
 	ClassifierTimeoutS   int
 	CacheTTLS            int
 	CacheMaxSize         int
+	ThinkingProvider     Provider
+	CodingProvider       Provider
+	SimpleProvider       Provider
+	DefaultProvider      Provider
 }
 
 type User struct {
@@ -139,6 +151,13 @@ func (s *Store) migrate() error {
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (key)
 		)`,
+		`CREATE TABLE IF NOT EXISTS providers (
+			id       INTEGER PRIMARY KEY AUTOINCREMENT,
+			name     TEXT NOT NULL UNIQUE,
+			type     TEXT NOT NULL CHECK(type IN ('ollama', 'openai', 'anthropic')),
+			base_url TEXT NOT NULL,
+			api_key  TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -152,7 +171,7 @@ func (s *Store) migrate() error {
 	// Add user management columns (ignore error if already exists)
 	s.db.Exec(`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'`)
 	s.db.Exec(`ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1`)
-	s.db.Exec(`ALTER TABLE users ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP`)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN created_at DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'`)
 	s.db.Exec(`ALTER TABLE api_keys ADD COLUMN user_id INTEGER REFERENCES users(id)`)
 	s.db.Exec(`ALTER TABLE sessions ADD COLUMN user_id INTEGER`)
 	// Add indices for commonly queried columns (idempotent)
@@ -164,6 +183,14 @@ func (s *Store) migrate() error {
 
 // SeedDefaults populates config from cfg for any keys not yet present.
 func (s *Store) SeedDefaults(cfg *config.Config) error {
+	// Seed the built-in Ollama provider (id=1) using the configured base URL.
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO providers (id, name, type, base_url, api_key) VALUES (1, 'Ollama (local)', 'ollama', ?, '')`,
+		cfg.OllamaBaseURL,
+	); err != nil {
+		return fmt.Errorf("seed ollama provider: %w", err)
+	}
+
 	defaults := map[string]string{
 		"ollama_base_url":        cfg.OllamaBaseURL,
 		"classifier_model":       cfg.ClassifierModel,
@@ -175,6 +202,10 @@ func (s *Store) SeedDefaults(cfg *config.Config) error {
 		"classifier_timeout_s":   strconv.Itoa(cfg.ClassifierTimeoutS),
 		"cache_ttl_s":            strconv.Itoa(cfg.CacheTTLS),
 		"cache_max_size":         strconv.Itoa(cfg.CacheMaxSize),
+		"thinking_provider_id":   "1",
+		"coding_provider_id":     "1",
+		"simple_provider_id":     "1",
+		"default_provider_id":    "1",
 	}
 	for k, v := range defaults {
 		if _, err := s.db.Exec(`INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)`, k, v); err != nil {
@@ -230,7 +261,7 @@ func (s *Store) GetConfig() (AppConfig, error) {
 		m[k] = v
 	}
 
-	return AppConfig{
+	cfg := AppConfig{
 		OllamaBaseURL:        m["ollama_base_url"],
 		ClassifierModel:      m["classifier_model"],
 		ThinkingModel:        m["thinking_model"],
@@ -241,7 +272,51 @@ func (s *Store) GetConfig() (AppConfig, error) {
 		ClassifierTimeoutS:   parseInt(m["classifier_timeout_s"], 10),
 		CacheTTLS:            parseInt(m["cache_ttl_s"], 300),
 		CacheMaxSize:         parseInt(m["cache_max_size"], 500),
-	}, nil
+	}
+
+	// Resolve per-role provider IDs.
+	roleProviderKeys := map[string]*Provider{
+		m["thinking_provider_id"]: &cfg.ThinkingProvider,
+		m["coding_provider_id"]:   &cfg.CodingProvider,
+		m["simple_provider_id"]:   &cfg.SimpleProvider,
+		m["default_provider_id"]:  &cfg.DefaultProvider,
+	}
+	// Collect unique IDs to fetch.
+	idSet := make(map[string]Provider)
+	for id := range roleProviderKeys {
+		if id == "" {
+			id = "1"
+		}
+		idSet[id] = Provider{}
+	}
+	for id := range idSet {
+		var p Provider
+		err := s.db.QueryRow(`SELECT id, name, type, base_url, api_key FROM providers WHERE id = ?`, id).
+			Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &p.APIKey)
+		if err != nil {
+			// fallback: use Ollama base URL from config
+			p = Provider{ID: 1, Name: "Ollama (local)", Type: "ollama", BaseURL: cfg.OllamaBaseURL}
+		}
+		idSet[id] = p
+	}
+
+	resolve := func(key string) Provider {
+		id := m[key]
+		if id == "" {
+			id = "1"
+		}
+		if p, ok := idSet[id]; ok {
+			return p
+		}
+		return Provider{ID: 1, Name: "Ollama (local)", Type: "ollama", BaseURL: cfg.OllamaBaseURL}
+	}
+
+	cfg.ThinkingProvider = resolve("thinking_provider_id")
+	cfg.CodingProvider = resolve("coding_provider_id")
+	cfg.SimpleProvider = resolve("simple_provider_id")
+	cfg.DefaultProvider = resolve("default_provider_id")
+
+	return cfg, nil
 }
 
 func parseInt(s string, def int) int {
@@ -797,6 +872,59 @@ func (s *Store) RecordLoginFailure(key string) (locked bool, err error) {
 // ClearLoginFailures resets the counter for key on successful login.
 func (s *Store) ClearLoginFailures(key string) {
 	s.db.Exec(`DELETE FROM login_attempts WHERE key = ?`, key)
+}
+
+// Provider CRUD
+
+func (s *Store) ListProviders() ([]Provider, error) {
+	rows, err := s.db.Query(`SELECT id, name, type, base_url, api_key FROM providers ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var providers []Provider
+	for rows.Next() {
+		var p Provider
+		if err := rows.Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &p.APIKey); err != nil {
+			return nil, err
+		}
+		providers = append(providers, p)
+	}
+	return providers, nil
+}
+
+func (s *Store) GetProvider(id int) (Provider, error) {
+	var p Provider
+	err := s.db.QueryRow(`SELECT id, name, type, base_url, api_key FROM providers WHERE id = ?`, id).
+		Scan(&p.ID, &p.Name, &p.Type, &p.BaseURL, &p.APIKey)
+	return p, err
+}
+
+func (s *Store) CreateProvider(name, provType, baseURL, apiKey string) (int64, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO providers (name, type, base_url, api_key) VALUES (?, ?, ?, ?)`,
+		name, provType, baseURL, apiKey,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateProvider(id int, name, provType, baseURL, apiKey string) error {
+	_, err := s.db.Exec(
+		`UPDATE providers SET name=?, type=?, base_url=?, api_key=? WHERE id=?`,
+		name, provType, baseURL, apiKey, id,
+	)
+	return err
+}
+
+func (s *Store) DeleteProvider(id int) error {
+	if id == 1 {
+		return fmt.Errorf("cannot delete built-in Ollama provider")
+	}
+	_, err := s.db.Exec(`DELETE FROM providers WHERE id = ?`, id)
+	return err
 }
 
 // Close closes the underlying database connection.

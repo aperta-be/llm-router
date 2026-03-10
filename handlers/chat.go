@@ -40,27 +40,45 @@ func (h *Handler) Chat(c *gin.Context) {
 
 	start := time.Now()
 
-	taskType, cfg, cacheHit, err := h.router.ClassifyTask(req.Messages)
-	if err != nil {
-		log.Printf("classification error: %v — falling back to default model", err)
-		taskType = "general"
-		if cfg.DefaultModel == "" {
-			if cfg, err = h.store.GetConfig(); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
-				return
+	var taskType string
+	var model string
+	var provider store.Provider
+	var cacheHit bool
+
+	if req.Model != "" && req.Model != "auto" {
+		// Client specified a model explicitly — skip routing logic.
+		cfg, err := h.store.GetConfig()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
+			return
+		}
+		taskType = "manual"
+		model = req.Model
+		provider = router.FindProviderForModel(req.Model, cfg)
+	} else {
+		var cfg store.AppConfig
+		var err error
+		taskType, cfg, cacheHit, err = h.router.ClassifyTask(req.Messages)
+		if err != nil {
+			log.Printf("classification error: %v — falling back to default model", err)
+			taskType = "general"
+			if cfg.DefaultModel == "" {
+				if cfg, err = h.store.GetConfig(); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "config unavailable"})
+					return
+				}
 			}
 		}
+		model, provider = router.SelectModelAndProvider(taskType, cfg)
 	}
-
-	model := router.SelectModel(taskType, cfg)
-	log.Printf("classification=%s model=%s stream=%v", taskType, model, req.Stream)
+	log.Printf("classification=%s model=%s provider=%s stream=%v", taskType, model, provider.Name, req.Stream)
 
 	c.Header("X-Router-Classification", taskType)
 	c.Header("X-Router-Model", model)
 
 	requestID, _ := c.Get("request_id")
 	reqID, _ := requestID.(string)
-	h.router.ForwardRequest(cfg.OllamaBaseURL, model, req, c.Writer, req.Stream, reqID)
+	h.router.ForwardRequest(provider, model, req, c.Writer, req.Stream, reqID)
 
 	latency := time.Since(start).Milliseconds()
 	go func() {

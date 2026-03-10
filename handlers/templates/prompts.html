@@ -56,7 +56,10 @@
         </td>
         <td class="mono" style="font-size:12px;white-space:nowrap">{{.Model}}</td>
         <td class="prompt-cell">{{.Prompt}}</td>
-        <td style="white-space:nowrap;font-size:13px">{{.LatencyMS}}ms</td>
+        <td style="white-space:nowrap;font-size:13px">
+          {{.LatencyMS}}ms
+          {{if .CacheHit}}<span style="font-size:10px;color:#0369a1;font-weight:600;margin-left:4px" title="Classification served from cache">cached</span>{{end}}
+        </td>
         <td style="font-size:13px">
           {{if eq .StatusCode 200}}<span style="color:#166534">{{.StatusCode}}</span>
           {{else}}<span style="color:#991b1b">{{.StatusCode}}</span>{{end}}
@@ -70,7 +73,7 @@
   <div class="pagination">
     {{if gt .PageNum 1}}<a href="/admin/prompts?page={{sub .PageNum 1}}&search={{.Search}}&classification={{.Classification}}&model={{.Model}}" class="page-btn">← Prev</a>{{end}}
     {{range $i := pages .Pages}}
-    <a href="/admin/prompts?page={{add $i 1}}&search=$.Search&classification=$.Classification&model=$.Model" class="page-btn {{if eq (add $i 1) $.PageNum}}active{{end}}">{{add $i 1}}</a>
+    <a href="/admin/prompts?page={{add $i 1}}&search={{$.Search}}&classification={{$.Classification}}&model={{$.Model}}" class="page-btn {{if eq (add $i 1) $.PageNum}}active{{end}}">{{add $i 1}}</a>
     {{end}}
     {{if lt .PageNum .Pages}}<a href="/admin/prompts?page={{add .PageNum 1}}&search={{.Search}}&classification={{.Classification}}&model={{.Model}}" class="page-btn">Next →</a>{{end}}
   </div>
