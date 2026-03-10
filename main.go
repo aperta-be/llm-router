@@ -44,7 +44,7 @@ func main() {
 
 	rt := router.New(db)
 	h := handlers.New(rt, db)
-	admin := handlers.NewAdmin(db)
+	admin := handlers.NewAdmin(db, cfg)
 
 	r := gin.New()
 	r.Use(middleware.Logger())
@@ -66,6 +66,9 @@ func main() {
 	// Admin: unauthenticated
 	r.GET("/admin/login", admin.LoginPage)
 	r.POST("/admin/login", admin.LoginSubmit)
+
+	r.GET("/admin/oauth/login", admin.OAuthLogin)
+	r.GET("/admin/oauth/callback", admin.OAuthCallback)
 
 	// Admin: authenticated (any role)
 	authed := r.Group("/admin", middleware.UserAuth(db))

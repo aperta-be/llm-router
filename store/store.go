@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -31,20 +32,29 @@ type Provider struct {
 }
 
 type AppConfig struct {
-	OllamaBaseURL        string
-	ClassifierModel      string
-	ThinkingModel        string
-	CodingModel          string
-	SimpleModel          string
-	DefaultModel         string
-	ClassificationPrompt string
-	ClassifierTimeoutS   int
-	CacheTTLS            int
-	CacheMaxSize         int
-	ThinkingProvider     Provider
-	CodingProvider       Provider
-	SimpleProvider       Provider
-	DefaultProvider      Provider
+	OllamaBaseURL         string
+	ClassifierModel       string
+	ThinkingModel         string
+	CodingModel           string
+	SimpleModel           string
+	DefaultModel          string
+	ClassificationPrompt  string
+	ClassifierTimeoutS    int
+	CacheTTLS             int
+	CacheMaxSize          int
+	ThinkingProvider      Provider
+	CodingProvider        Provider
+	SimpleProvider        Provider
+	DefaultProvider       Provider
+	OAuthEnabled          bool
+	OAuthIssuerURL        string
+	OAuthClientID         string
+	OAuthClientSecret     string
+	OAuthRedirectURL      string
+	OAuthScopes           string // space-separated, e.g. "openid email profile"
+	OAuthRoleClaim        string
+	OAuthAdminValues      string // comma-separated, e.g. "admin"
+	OAuthPasswordFallback bool
 }
 
 type User struct {
@@ -178,6 +188,10 @@ func (s *Store) migrate() error {
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp)`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model)`)
 	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_requests_classification ON requests(classification)`)
+	// Add OAuth columns (ignore error if already exists)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN oauth_sub TEXT UNIQUE`)
+	s.db.Exec(`ALTER TABLE users ADD COLUMN oauth_email TEXT`)
+	s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oauth_sub ON users(oauth_sub) WHERE oauth_sub IS NOT NULL`)
 	return nil
 }
 
@@ -191,21 +205,51 @@ func (s *Store) SeedDefaults(cfg *config.Config) error {
 		return fmt.Errorf("seed ollama provider: %w", err)
 	}
 
+	oauthEnabled := "false"
+	if cfg.OAuthEnabled {
+		oauthEnabled = "true"
+	}
+	oauthPasswordFallback := "true"
+	if !cfg.OAuthPasswordFallback {
+		oauthPasswordFallback = "false"
+	}
+	oauthScopes := strings.Join(cfg.OAuthScopes, " ")
+	if oauthScopes == "" {
+		oauthScopes = "openid email profile"
+	}
+	oauthAdminValues := strings.Join(cfg.OAuthAdminValues, ",")
+	if oauthAdminValues == "" {
+		oauthAdminValues = "admin"
+	}
+	oauthRoleClaim := cfg.OAuthRoleClaim
+	if oauthRoleClaim == "" {
+		oauthRoleClaim = "groups"
+	}
+
 	defaults := map[string]string{
-		"ollama_base_url":        cfg.OllamaBaseURL,
-		"classifier_model":       cfg.ClassifierModel,
-		"thinking_model":         cfg.ThinkingModel,
-		"coding_model":           cfg.CodingModel,
-		"simple_model":           cfg.SimpleModel,
-		"default_model":          cfg.DefaultModel,
-		"classification_prompt":  cfg.ClassificationPrompt,
-		"classifier_timeout_s":   strconv.Itoa(cfg.ClassifierTimeoutS),
-		"cache_ttl_s":            strconv.Itoa(cfg.CacheTTLS),
-		"cache_max_size":         strconv.Itoa(cfg.CacheMaxSize),
-		"thinking_provider_id":   "1",
-		"coding_provider_id":     "1",
-		"simple_provider_id":     "1",
-		"default_provider_id":    "1",
+		"ollama_base_url":         cfg.OllamaBaseURL,
+		"classifier_model":        cfg.ClassifierModel,
+		"thinking_model":          cfg.ThinkingModel,
+		"coding_model":            cfg.CodingModel,
+		"simple_model":            cfg.SimpleModel,
+		"default_model":           cfg.DefaultModel,
+		"classification_prompt":   cfg.ClassificationPrompt,
+		"classifier_timeout_s":    strconv.Itoa(cfg.ClassifierTimeoutS),
+		"cache_ttl_s":             strconv.Itoa(cfg.CacheTTLS),
+		"cache_max_size":          strconv.Itoa(cfg.CacheMaxSize),
+		"thinking_provider_id":    "1",
+		"coding_provider_id":      "1",
+		"simple_provider_id":      "1",
+		"default_provider_id":     "1",
+		"oauth_enabled":           oauthEnabled,
+		"oauth_issuer_url":        cfg.OAuthIssuerURL,
+		"oauth_client_id":         cfg.OAuthClientID,
+		"oauth_client_secret":     cfg.OAuthClientSecret,
+		"oauth_redirect_url":      cfg.OAuthRedirectURL,
+		"oauth_scopes":            oauthScopes,
+		"oauth_role_claim":        oauthRoleClaim,
+		"oauth_admin_values":      oauthAdminValues,
+		"oauth_password_fallback": oauthPasswordFallback,
 	}
 	for k, v := range defaults {
 		if _, err := s.db.Exec(`INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)`, k, v); err != nil {
@@ -262,16 +306,25 @@ func (s *Store) GetConfig() (AppConfig, error) {
 	}
 
 	cfg := AppConfig{
-		OllamaBaseURL:        m["ollama_base_url"],
-		ClassifierModel:      m["classifier_model"],
-		ThinkingModel:        m["thinking_model"],
-		CodingModel:          m["coding_model"],
-		SimpleModel:          m["simple_model"],
-		DefaultModel:         m["default_model"],
-		ClassificationPrompt: m["classification_prompt"],
-		ClassifierTimeoutS:   parseInt(m["classifier_timeout_s"], 10),
-		CacheTTLS:            parseInt(m["cache_ttl_s"], 300),
-		CacheMaxSize:         parseInt(m["cache_max_size"], 500),
+		OllamaBaseURL:         m["ollama_base_url"],
+		ClassifierModel:       m["classifier_model"],
+		ThinkingModel:         m["thinking_model"],
+		CodingModel:           m["coding_model"],
+		SimpleModel:           m["simple_model"],
+		DefaultModel:          m["default_model"],
+		ClassificationPrompt:  m["classification_prompt"],
+		ClassifierTimeoutS:    parseInt(m["classifier_timeout_s"], 10),
+		CacheTTLS:             parseInt(m["cache_ttl_s"], 300),
+		CacheMaxSize:          parseInt(m["cache_max_size"], 500),
+		OAuthEnabled:          m["oauth_enabled"] == "true",
+		OAuthIssuerURL:        m["oauth_issuer_url"],
+		OAuthClientID:         m["oauth_client_id"],
+		OAuthClientSecret:     m["oauth_client_secret"],
+		OAuthRedirectURL:      m["oauth_redirect_url"],
+		OAuthScopes:           m["oauth_scopes"],
+		OAuthRoleClaim:        m["oauth_role_claim"],
+		OAuthAdminValues:      m["oauth_admin_values"],
+		OAuthPasswordFallback: m["oauth_password_fallback"] != "false", // default true
 	}
 
 	// Resolve per-role provider IDs.
@@ -925,6 +978,68 @@ func (s *Store) DeleteProvider(id int) error {
 	}
 	_, err := s.db.Exec(`DELETE FROM providers WHERE id = ?`, id)
 	return err
+}
+
+// FindUserByOAuthSub looks up a user by their OAuth subject identifier.
+func (s *Store) FindUserByOAuthSub(sub string) (User, error) {
+	var u User
+	var active int64
+	err := s.db.QueryRow(`SELECT id, username, role, active FROM users WHERE oauth_sub = ?`, sub).
+		Scan(&u.ID, &u.Username, &u.Role, &active)
+	if err != nil {
+		return User{}, err
+	}
+	u.Active = active == 1
+	return u, nil
+}
+
+// UpdateOAuthSub links an existing user account to an OAuth subject.
+func (s *Store) UpdateOAuthSub(userID int64, sub, email string) error {
+	_, err := s.db.Exec(`UPDATE users SET oauth_sub = ?, oauth_email = ? WHERE id = ?`, sub, email, userID)
+	return err
+}
+
+// FindOrCreateOAuthUser returns the user for the given OAuth subject, creating one if needed.
+func (s *Store) FindOrCreateOAuthUser(sub, email, username, role string) (User, error) {
+	// 1. Try finding by oauth_sub
+	u, err := s.FindUserByOAuthSub(sub)
+	if err == nil {
+		if !u.Active {
+			return User{}, fmt.Errorf("account is disabled")
+		}
+		return u, nil
+	}
+	if err != sql.ErrNoRows {
+		return User{}, err
+	}
+
+	// 2. Check if a user with the same username exists (e.g. seeded admin)
+	var existing User
+	var active int64
+	lookErr := s.db.QueryRow(`SELECT id, username, role, active FROM users WHERE username = ?`, username).
+		Scan(&existing.ID, &existing.Username, &existing.Role, &active)
+	if lookErr == nil {
+		existing.Active = active == 1
+		if !existing.Active {
+			return User{}, fmt.Errorf("account is disabled")
+		}
+		// Link the oauth_sub to the existing account
+		if err := s.UpdateOAuthSub(existing.ID, sub, email); err != nil {
+			return User{}, err
+		}
+		return existing, nil
+	}
+
+	// 3. Create a new user
+	res, err := s.db.Exec(
+		`INSERT INTO users (username, password_hash, role, active, oauth_sub, oauth_email, created_at) VALUES (?, '', ?, 1, ?, ?, ?)`,
+		username, role, sub, email, time.Now(),
+	)
+	if err != nil {
+		return User{}, err
+	}
+	id, _ := res.LastInsertId()
+	return User{ID: id, Username: username, Role: role, Active: true}, nil
 }
 
 // Close closes the underlying database connection.

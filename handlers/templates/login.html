@@ -24,6 +24,7 @@
     <div class="brand">⚡ <span>LLM</span> Router</div>
     <div class="subtitle">Admin Panel</div>
     {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+    {{if .PasswordEnabled}}
     <form method="POST" action="/admin/login">
       <label for="username">Username</label>
       <input type="text" id="username" name="username" autocomplete="username" required>
@@ -31,6 +32,15 @@
       <input type="password" id="password" name="password" autocomplete="current-password" required>
       <button class="btn" type="submit">Sign in</button>
     </form>
+    {{end}}
+    {{if .OAuthEnabled}}
+    <div style="margin-top:20px;text-align:center">
+      <div style="font-size:12px;color:#94a3b8;margin-bottom:12px">or</div>
+      <a href="/admin/oauth/login" style="display:block;width:100%;padding:10px;background:#0f172a;color:#fff;border-radius:7px;font-size:14px;font-weight:500;text-decoration:none;text-align:center">
+        Login with SSO
+      </a>
+    </div>
+    {{end}}
   </div>
 </body>
 </html>

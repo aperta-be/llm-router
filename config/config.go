@@ -1,6 +1,9 @@
 package config
 
-import "os"
+import (
+	"os"
+	"strings"
+)
 
 const DefaultClassificationPrompt = `You are a task classifier. Reply with only one word: thinking, coding, simple, or general.
 
@@ -42,6 +45,17 @@ type Config struct {
 	DBPath               string
 	AdminUsername        string
 	AdminPassword        string
+
+	// OAuth2/OIDC settings
+	OAuthEnabled         bool
+	OAuthIssuerURL       string
+	OAuthClientID        string
+	OAuthClientSecret    string
+	OAuthRedirectURL     string
+	OAuthScopes          []string
+	OAuthRoleClaim       string
+	OAuthAdminValues     []string
+	OAuthPasswordFallback bool // allow password login alongside SSO; default true
 }
 
 func Load() *Config {
@@ -70,6 +84,21 @@ func Load() *Config {
 		adminPass = "admin"
 	}
 
+	oauthScopes := []string{"openid", "email", "profile"}
+	if s := os.Getenv("OAUTH_SCOPES"); s != "" {
+		oauthScopes = strings.Fields(s)
+	}
+
+	oauthAdminValues := []string{"admin"}
+	if s := os.Getenv("OAUTH_ADMIN_VALUES"); s != "" {
+		oauthAdminValues = strings.Split(s, ",")
+	}
+
+	oauthRoleClaim := os.Getenv("OAUTH_ROLE_CLAIM")
+	if oauthRoleClaim == "" {
+		oauthRoleClaim = "groups"
+	}
+
 	return &Config{
 		OllamaBaseURL:        ollamaURL,
 		ClassifierModel:      "llama3.2:3b",
@@ -85,5 +114,15 @@ func Load() *Config {
 		DBPath:               dbPath,
 		AdminUsername:        adminUser,
 		AdminPassword:        adminPass,
+
+		OAuthEnabled:         os.Getenv("OAUTH_ENABLED") == "true",
+		OAuthIssuerURL:       os.Getenv("OAUTH_ISSUER_URL"),
+		OAuthClientID:        os.Getenv("OAUTH_CLIENT_ID"),
+		OAuthClientSecret:    os.Getenv("OAUTH_CLIENT_SECRET"),
+		OAuthRedirectURL:     os.Getenv("OAUTH_REDIRECT_URL"),
+		OAuthScopes:          oauthScopes,
+		OAuthRoleClaim:       oauthRoleClaim,
+		OAuthAdminValues:     oauthAdminValues,
+		OAuthPasswordFallback: os.Getenv("OAUTH_PASSWORD_FALLBACK") != "false", // default true
 	}
 }

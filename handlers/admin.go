@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -10,10 +13,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/oauth2"
 
+	"github.com/aperta-be/llm-router/config"
 	"github.com/aperta-be/llm-router/store"
 )
 
@@ -24,11 +31,47 @@ const sessionCookie = "llmr_session"
 const perPage = 25
 
 type AdminHandler struct {
-	store *store.Store
+	store         *store.Store
+	cfg           *config.Config
+	mu            sync.Mutex
+	provider      *gooidc.Provider
+	lastIssuerURL string
 }
 
-func NewAdmin(s *store.Store) *AdminHandler {
-	return &AdminHandler{store: s}
+func NewAdmin(s *store.Store, cfg *config.Config) *AdminHandler {
+	return &AdminHandler{store: s, cfg: cfg}
+}
+
+// getOAuthClients returns a cached (or freshly initialised) OIDC provider and
+// oauth2.Config built from the current DB config. Thread-safe.
+func (h *AdminHandler) getOAuthClients(dbCfg store.AppConfig) (*gooidc.Provider, *oauth2.Config, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.provider == nil || h.lastIssuerURL != dbCfg.OAuthIssuerURL {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		p, err := gooidc.NewProvider(ctx, dbCfg.OAuthIssuerURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("oidc discovery failed for %s: %w", dbCfg.OAuthIssuerURL, err)
+		}
+		h.provider = p
+		h.lastIssuerURL = dbCfg.OAuthIssuerURL
+	}
+
+	scopes := strings.Fields(dbCfg.OAuthScopes)
+	if len(scopes) == 0 {
+		scopes = []string{"openid", "email", "profile"}
+	}
+
+	oa2 := &oauth2.Config{
+		ClientID:     dbCfg.OAuthClientID,
+		ClientSecret: dbCfg.OAuthClientSecret,
+		RedirectURL:  dbCfg.OAuthRedirectURL,
+		Endpoint:     h.provider.Endpoint(),
+		Scopes:       scopes,
+	}
+	return h.provider, oa2, nil
 }
 
 // render executes base.html + pageName template.
@@ -72,12 +115,22 @@ func (h *AdminHandler) render(c *gin.Context, pageName string, data any) {
 // --- Login / Logout ---
 
 func (h *AdminHandler) LoginPage(c *gin.Context) {
+	dbCfg, _ := h.store.GetConfig()
 	tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
 	c.Header("Content-Type", "text/html; charset=utf-8")
-	tmpl.Execute(c.Writer, gin.H{"Error": ""})
+	tmpl.Execute(c.Writer, gin.H{
+		"Error":           c.Query("error"),
+		"OAuthEnabled":    dbCfg.OAuthEnabled,
+		"PasswordEnabled": !dbCfg.OAuthEnabled || dbCfg.OAuthPasswordFallback,
+	})
 }
 
 func (h *AdminHandler) LoginSubmit(c *gin.Context) {
+	dbCfg, _ := h.store.GetConfig()
+	if dbCfg.OAuthEnabled && !dbCfg.OAuthPasswordFallback {
+		c.Status(http.StatusNotFound)
+		return
+	}
 	username := c.PostForm("username")
 	password := c.PostForm("password")
 	ip := c.ClientIP()
@@ -88,7 +141,7 @@ func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Status(http.StatusTooManyRequests)
-		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes."})
+		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes.", "OAuthEnabled": h.cfg.OAuthEnabled})
 		return
 	}
 	// Also check by IP
@@ -97,7 +150,7 @@ func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Status(http.StatusTooManyRequests)
-		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes."})
+		tmpl.Execute(c.Writer, gin.H{"Error": "Too many failed attempts. Try again in 15 minutes.", "OAuthEnabled": h.cfg.OAuthEnabled})
 		return
 	}
 
@@ -108,7 +161,7 @@ func (h *AdminHandler) LoginSubmit(c *gin.Context) {
 		tmpl, _ := template.ParseFS(templateFS, "templates/login.html")
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.Status(http.StatusUnauthorized)
-		tmpl.Execute(c.Writer, gin.H{"Error": "Invalid username or password."})
+		tmpl.Execute(c.Writer, gin.H{"Error": "Invalid username or password.", "OAuthEnabled": h.cfg.OAuthEnabled})
 		return
 	}
 
@@ -148,6 +201,210 @@ func (h *AdminHandler) Logout(c *gin.Context) {
 		SameSite: http.SameSiteLaxMode,
 	})
 	c.Redirect(http.StatusFound, "/admin/login")
+}
+
+// --- OAuth2/OIDC ---
+
+func (h *AdminHandler) OAuthLogin(c *gin.Context) {
+	dbCfg, err := h.store.GetConfig()
+	if err != nil || !dbCfg.OAuthEnabled {
+		c.Redirect(http.StatusFound, "/admin/login?error=SSO+not+enabled")
+		return
+	}
+
+	_, oa2, err := h.getOAuthClients(dbCfg)
+	if err != nil {
+		log.Printf("oauth init error: %v", err)
+		c.Redirect(http.StatusFound, "/admin/login?error=SSO+configuration+error")
+		return
+	}
+
+	stateBytes := make([]byte, 16)
+	if _, err := rand.Read(stateBytes); err != nil {
+		c.Redirect(http.StatusFound, "/admin/login?error=Login+failed")
+		return
+	}
+	state := hex.EncodeToString(stateBytes)
+
+	verifierBytes := make([]byte, 64)
+	if _, err := rand.Read(verifierBytes); err != nil {
+		c.Redirect(http.StatusFound, "/admin/login?error=Login+failed")
+		return
+	}
+	verifier := hex.EncodeToString(verifierBytes)
+
+	cookieAttrs := &http.Cookie{
+		MaxAge:   600,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Path:     "/admin/oauth/",
+	}
+	cookieAttrs.Name = "llmr_oauth_state"
+	cookieAttrs.Value = state
+	http.SetCookie(c.Writer, cookieAttrs)
+	cookieAttrs.Name = "llmr_oauth_pkce"
+	cookieAttrs.Value = verifier
+	http.SetCookie(c.Writer, cookieAttrs)
+
+	c.Redirect(http.StatusFound, oa2.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier)))
+}
+
+func (h *AdminHandler) OAuthCallback(c *gin.Context) {
+	loginFail := func(msg string) {
+		c.Redirect(http.StatusFound, "/admin/login?error="+url.QueryEscape(msg))
+	}
+
+	dbCfg, err := h.store.GetConfig()
+	if err != nil || !dbCfg.OAuthEnabled {
+		loginFail("SSO not enabled")
+		return
+	}
+
+	provider, oa2, err := h.getOAuthClients(dbCfg)
+	if err != nil {
+		log.Printf("oauth init error: %v", err)
+		loginFail("Login failed")
+		return
+	}
+
+	// Validate state
+	stateCookie, err := c.Cookie("llmr_oauth_state")
+	if err != nil || stateCookie != c.Query("state") {
+		loginFail("Login failed")
+		return
+	}
+
+	// Check for IdP error
+	if errParam := c.Query("error"); errParam != "" {
+		loginFail("Login cancelled")
+		return
+	}
+
+	pkceVerifier, err := c.Cookie("llmr_oauth_pkce")
+	if err != nil {
+		loginFail("Login failed")
+		return
+	}
+
+	ctx := context.Background()
+
+	token, err := oa2.Exchange(ctx, c.Query("code"), oauth2.VerifierOption(pkceVerifier))
+	if err != nil {
+		log.Printf("oauth2 exchange error: %v", err)
+		loginFail("Login failed")
+		return
+	}
+
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		loginFail("Login failed")
+		return
+	}
+	idToken, err := provider.Verifier(&gooidc.Config{ClientID: dbCfg.OAuthClientID}).Verify(ctx, rawIDToken)
+	if err != nil {
+		log.Printf("oidc verify error: %v", err)
+		loginFail("Login failed")
+		return
+	}
+
+	var claims map[string]interface{}
+	if err := idToken.Claims(&claims); err != nil {
+		loginFail("Login failed")
+		return
+	}
+
+	sub, _ := claims["sub"].(string)
+	email, _ := claims["email"].(string)
+	preferredUsername, _ := claims["preferred_username"].(string)
+
+	username := email
+	if username == "" {
+		username = preferredUsername
+	}
+	if username == "" {
+		username = sub
+	}
+
+	adminValues := strings.Split(dbCfg.OAuthAdminValues, ",")
+	role := mapRole(claims, dbCfg.OAuthRoleClaim, adminValues)
+
+	user, err := h.store.FindOrCreateOAuthUser(sub, email, username, role)
+	if err != nil {
+		log.Printf("oauth find/create user error: %v", err)
+		loginFail("Login failed")
+		return
+	}
+
+	sessionToken, err := h.store.CreateSession(user.ID)
+	if err != nil {
+		loginFail("Login failed")
+		return
+	}
+
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    sessionToken,
+		MaxAge:   86400,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	for _, name := range []string{"llmr_oauth_state", "llmr_oauth_pkce"} {
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			MaxAge:   -1,
+			Path:     "/admin/oauth/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
+	if user.Role == "admin" {
+		c.Redirect(http.StatusFound, "/admin/dashboard")
+	} else {
+		c.Redirect(http.StatusFound, "/admin/keys")
+	}
+}
+
+// mapRole determines a user's role based on OIDC claims.
+// claimName supports dot-notation for nested claims (e.g. "realm_access.roles").
+func mapRole(claims map[string]interface{}, claimName string, adminValues []string) string {
+	// Resolve dot-notation
+	parts := strings.SplitN(claimName, ".", 2)
+	var claimVal interface{}
+	if len(parts) == 2 {
+		if nested, ok := claims[parts[0]].(map[string]interface{}); ok {
+			claimVal = nested[parts[1]]
+		}
+	} else {
+		claimVal = claims[claimName]
+	}
+
+	adminSet := make(map[string]struct{}, len(adminValues))
+	for _, v := range adminValues {
+		adminSet[strings.TrimSpace(v)] = struct{}{}
+	}
+
+	check := func(s string) bool {
+		_, ok := adminSet[s]
+		return ok
+	}
+
+	switch v := claimVal.(type) {
+	case string:
+		if check(v) {
+			return "admin"
+		}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok && check(s) {
+				return "admin"
+			}
+		}
+	}
+	return "user"
 }
 
 // --- Dashboard ---
@@ -215,12 +472,13 @@ func periodToTime(period string) time.Time {
 // --- Config ---
 
 type configData struct {
-	Page      string
-	Role      string
-	Cfg       store.AppConfig
-	Providers []store.Provider
-	Saved     bool
-	Errors    []string
+	Page         string
+	Role         string
+	Cfg          store.AppConfig
+	Providers    []store.Provider
+	Saved        bool
+	Errors       []string
+	OAuthEnabled bool
 }
 
 func (h *AdminHandler) ConfigPage(c *gin.Context) {
@@ -229,7 +487,13 @@ func (h *AdminHandler) ConfigPage(c *gin.Context) {
 		log.Printf("get config: %v", err)
 	}
 	providers, _ := h.store.ListProviders()
-	h.render(c, "config.html", configData{Page: "config", Role: c.GetString("user_role"), Cfg: cfg, Providers: providers})
+	h.render(c, "config.html", configData{
+		Page:         "config",
+		Role:         c.GetString("user_role"),
+		Cfg:          cfg,
+		Providers:    providers,
+		OAuthEnabled: cfg.OAuthEnabled,
+	})
 }
 
 func (h *AdminHandler) ConfigSave(c *gin.Context) {
@@ -248,6 +512,13 @@ func (h *AdminHandler) ConfigSave(c *gin.Context) {
 		"coding_provider_id":     c.PostForm("coding_provider_id"),
 		"simple_provider_id":     c.PostForm("simple_provider_id"),
 		"default_provider_id":    c.PostForm("default_provider_id"),
+		// OAuth text fields (secret handled separately below)
+		"oauth_issuer_url":   c.PostForm("oauth_issuer_url"),
+		"oauth_client_id":    c.PostForm("oauth_client_id"),
+		"oauth_redirect_url": c.PostForm("oauth_redirect_url"),
+		"oauth_scopes":       c.PostForm("oauth_scopes"),
+		"oauth_role_claim":   c.PostForm("oauth_role_claim"),
+		"oauth_admin_values": c.PostForm("oauth_admin_values"),
 	}
 
 	var errs []string
@@ -293,13 +564,46 @@ func (h *AdminHandler) ConfigSave(c *gin.Context) {
 		}
 	}
 
+	// Checkboxes: only present in POST when checked; must always be saved explicitly.
+	oauthEnabled := "false"
+	if c.PostForm("oauth_enabled") == "on" {
+		oauthEnabled = "true"
+	}
+	if err := h.store.SetConfigValue("oauth_enabled", oauthEnabled); err != nil {
+		log.Printf("set config oauth_enabled: %v", err)
+		errs = append(errs, fmt.Sprintf("Failed to save oauth_enabled: %v", err))
+	}
+	// Invalidate cached OIDC provider whenever OAuth settings are saved so next
+	// request picks up any issuer URL change.
+	h.mu.Lock()
+	h.provider = nil
+	h.lastIssuerURL = ""
+	h.mu.Unlock()
+
+	oauthPwFallback := "false"
+	if c.PostForm("oauth_password_fallback") == "on" {
+		oauthPwFallback = "true"
+	}
+	if err := h.store.SetConfigValue("oauth_password_fallback", oauthPwFallback); err != nil {
+		log.Printf("set config oauth_password_fallback: %v", err)
+		errs = append(errs, fmt.Sprintf("Failed to save oauth_password_fallback: %v", err))
+	}
+
+	// Client secret: only overwrite if a new value was provided.
+	if secret := c.PostForm("oauth_client_secret"); secret != "" {
+		if err := h.store.SetConfigValue("oauth_client_secret", secret); err != nil {
+			log.Printf("set config oauth_client_secret: %v", err)
+			errs = append(errs, fmt.Sprintf("Failed to save oauth_client_secret: %v", err))
+		}
+	}
+
 	cfg, _ := h.store.GetConfig()
 	providers, _ := h.store.ListProviders()
 	if len(errs) > 0 {
-		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, Errors: errs})
+		h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, OAuthEnabled: cfg.OAuthEnabled, Errors: errs})
 		return
 	}
-	h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, Saved: true})
+	h.render(c, "config.html", configData{Page: "config", Role: role, Cfg: cfg, Providers: providers, OAuthEnabled: cfg.OAuthEnabled, Saved: true})
 }
 
 // --- API Keys ---
